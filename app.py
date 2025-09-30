@@ -53,9 +53,9 @@ def _new_ads_client(login_cid: Optional[str] = None) -> GoogleAdsClient:
     return GoogleAdsClient.load_from_dict(cfg)
 
 def _ga_search(svc, customer_id: str, query: str, page_size: Optional[int] = None, page_token: Optional[str] = None):
-    req = {"customer_id": customer_id, "query": query}
-    if page_size:
-        req["page_size"] = int(page_size)
+    # Newer google-ads clients enforce a fixed server-side page size (10,000).
+    # Sending page_size causes INVALID_ARGUMENT. We therefore ignore it.
++    req = {"customer_id": customer_id, "query": query}
     if page_token:
         req["page_token"] = page_token
     # Use your retry wrapper
@@ -184,7 +184,9 @@ def _refresh_account_cache(root_mcc: Optional[str]) -> None:
         """
         rows = _ads_call(lambda: svc.search(request={
             "customer_id": str(root_mcc).replace("-",""),
-            "query": q, "page_size": 1000}))
+            "query": q
+            # server-fixed page size; do not set page_size
+        }))
         local = {}
         for r in rows:
             name = r.customer_client.descriptive_name or ""
@@ -341,7 +343,9 @@ TOOLS = [
                     "description": "TODAY|YESTERDAY|LAST_7_DAYS|LAST_30_DAYS|THIS_MONTH|LAST_MONTH"},
                 "time_range": {"type": "object", "properties": {"since": {"type": "string"}, "until": {"type": "string"}},
                     "description": "Explicit YYYY-MM-DD range (overrides date_preset)"},
-                "page_size":  {"type": "integer", "minimum": 1, "maximum": 10000, "default": 1000},
+                "page_size":  {"type": "integer",
+                   "description": "DEPRECATED/IGNORED: Google Ads search uses a fixed server page size.",
+                   "minimum": 1, "maximum": 10000, "default": 1000},
                 "page_token": {"type": ["string","null"]},
                 "login_customer_id": {"type": "string", "description": "Manager id for header (optional)"}
             }
@@ -474,8 +478,8 @@ def tool_fetch_account_tree(args: Dict[str, Any]) -> Dict[str, Any]:
     """
     rows = _ads_call(lambda: svc.search(request={
         "customer_id": str(root),
-        "query": q,
-        "page_size": 1000
+        "query": q
+        # server-fixed page size; do not set page_size
     }))
     out = []
     for r in rows:
@@ -522,12 +526,9 @@ def tool_fetch_metrics(args: Dict[str, Any]) -> Dict[str, Any]:
     q = f"""SELECT {", ".join(select_cols)} FROM {frm} WHERE {where_time} {where_ids}"""
     client = _new_ads_client(login_cid=login)
     svc = client.get_service("GoogleAdsService")
-    page_size = int(args.get("page_size", 1000))
     page_token = args.get("page_token")
 
     req = {"customer_id": str(customer_id), "query": q}
-    if page_size:
-        req["page_size"] = page_size
     if page_token:
         req["page_token"] = page_token
     resp = _ads_call(lambda: svc.search(request=req))
@@ -593,8 +594,8 @@ def tool_fetch_campaign_summary(args: Dict[str, Any]) -> Dict[str, Any]:
     svc = client.get_service("GoogleAdsService")
     rows = _ads_call(lambda: svc.search(request={
         "customer_id": str(customer_id),
-        "query": q,
-        "page_size": 5000
+        "query": q
+        # server-fixed page size; do not set page_size
     }))
     out = []
     for r in rows:
@@ -645,8 +646,8 @@ def tool_list_recommendations(args: Dict[str, Any]) -> Dict[str, Any]:
     svc = client.get_service("GoogleAdsService")
     rows = _ads_call(lambda: svc.search(request={
         "customer_id": str(customer_id),
-        "query": q,
-        "page_size": 1000
+        "query": q
+        # server-fixed page size; do not set page_size
     }))
     out = []
     for r in rows:
@@ -688,8 +689,8 @@ def tool_fetch_search_terms(args: Dict[str, Any]) -> Dict[str, Any]:
     svc = client.get_service("GoogleAdsService")
     rows = _ads_call(lambda: svc.search(request={
         "customer_id": str(customer_id),
-        "query": q,
-        "page_size": 5000
+        "query": q
+        # server-fixed page size; do not set page_size
     }))
     out = []
     for r in rows:
@@ -733,8 +734,8 @@ def tool_fetch_change_history(args: Dict[str, Any]) -> Dict[str, Any]:
     svc = client.get_service("GoogleAdsService")
     rows = _ads_call(lambda: svc.search(request={
         "customer_id": str(customer_id),
-        "query": q,
-        "page_size": 1000
+        "query": q
+        # server-fixed page size; do not set page_size
     }))
     out = []
     for r in rows:
@@ -777,8 +778,8 @@ def tool_fetch_budget_pacing(args: Dict[str, Any]) -> Dict[str, Any]:
     svc = client.get_service("GoogleAdsService")
     rows = _ads_call(lambda: svc.search(request={
         "customer_id": str(customer_id),
-        "query": q,
-        "page_size": 1000
+        "query": q
+        # server-fixed page size; do not set page_size
     }))
     mtd_cost = 0
     for r in rows:
