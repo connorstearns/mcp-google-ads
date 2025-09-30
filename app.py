@@ -819,35 +819,38 @@ async def rpc(request: Request):
             # Allow listing tools without auth (client may use any of these variants)
             "tools/list", "tools.list", "list_tools", "tools.index",
         }
-        public_tools = {"ping"}  # safe public tool
+        public_tools = {"ping"}
+
+        def _unauth(_id):
+            return JSONResponse(
+                {"jsonrpc": "2.0", "id": _id,
+                 "error": {"code": -32001, "message": "Unauthorized"}},
+                status_code=401,
+                headers={
+                    "MCP-Protocol-Version": request.headers.get("MCP-Protocol-Version", MCP_PROTO_DEFAULT),
+                    "WWW-Authenticate": 'Bearer realm="mcp-google-ads"'
+                }
+            )
         
-        if MCP_SHARED_KEY:
-            if method not in public_methods:
-                if method == "tools/call":
-                    params = (payload.get("params") or {})
-                    tool_name = (params.get("name") or "").lower()
-                    if tool_name not in public_tools:
-                        if _get_shared_key(request) != MCP_SHARED_KEY:
-                            return JSONResponse(
-                                {"jsonrpc": "2.0", "id": _id,
-                                 "error": {"code": -32001, "message": "Unauthorized"}},
-                                status_code=401,
-                                headers={
-                                    "MCP-Protocol-Version": request.headers.get("MCP-Protocol-Version", MCP_PROTO_DEFAULT),
-                                    "WWW-Authenticate": 'Bearer realm="mcp-google-ads"'
-                                }
-                            )
-                else:
-                    if _get_shared_key(request) != MCP_SHARED_KEY:
-                        return JSONResponse(
-                            {"jsonrpc": "2.0", "id": _id,
-                             "error": {"code": -32001, "message": "Unauthorized"}},
-                            status_code=401,
-                            headers={
-                                "MCP-Protocol-Version": request.headers.get("MCP-Protocol-Version", MCP_PROTO_DEFAULT),
-                                "WWW-Authenticate": 'Bearer realm="mcp-google-ads"'
-                            }
-                        )
+        require_key = bool(MCP_SHARED_KEY)
+        
+        if require_key and method == "tools/call":
+            params = (payload.get("params") or {})
+            tool_name = (params.get("name") or "").lower()
+            if tool_name not in public_tools:
+                # Accept either Authorization: Bearer <key> OR X-MCP-Key: <key>
+                auth_hdr = request.headers.get("Authorization", "")
+                bearer_ok = auth_hdr.lower().startswith("bearer ") and auth_hdr.split(" ", 1)[1].strip() == MCP_SHARED_KEY
+                xhdr_ok = request.headers.get("X-MCP-Key", "") == MCP_SHARED_KEY
+                if not (bearer_ok or xhdr_ok):
+                log.warning(
+                    "401 on tools/call tool=%s has_bearer=%s has_xmcp=%s",
+                    tool_name,
+                    request.headers.get("Authorization","").lower().startswith("bearer "),
+                    "X-MCP-Key" in request.headers
+                )
+                    return _unauth(_id)
+        # NOTE: all other methods (initialize, tools/list variants, etc.) never require auth.
 
         # initialize
         if method == "initialize":
