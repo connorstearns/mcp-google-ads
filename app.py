@@ -620,11 +620,14 @@ async def root_get(request: Request):
 
 @app.get("/.well-known/mcp.json")
 def mcp_discovery():
+    auth = {"type": "none"}
+    if MCP_SHARED_KEY:
+        auth = {"type": "shared-secret", "tokenHeader": "X-MCP-Key"}
     return JSONResponse({
         "mcpVersion": MCP_PROTO_DEFAULT,
         "name": APP_NAME,
         "version": APP_VER,
-        "auth": {"type": "none"},
+        "auth": auth,
         "capabilities": {"tools": {"listChanged": True}},
         "endpoints": {"rpc": "/"},
         "tools": TOOLS
@@ -637,13 +640,29 @@ def mcp_tools():
 # ---------- JSON-RPC ----------
 @app.post("/")
 async def rpc(request: Request):
-    maybe = _authz_check(request)
-    if maybe: return maybe
-
     try:
         payload = await request.json()
-        method  = (payload.get("method") or "").lower()
         _id     = payload.get("id")
+
+        # Auth AFTER we know _id
+        if MCP_SHARED_KEY:
+            key = request.headers.get("X-MCP-Key", "")
+            if key != MCP_SHARED_KEY:
+                return JSONResponse(
+                    {"jsonrpc": "2.0", "id": _id,
+                     "error": {"code": -32001, "message": "Unauthorized"}},
+                    status_code=401
+                )
+
+        method  = (payload.get("method") or "").lower()
+
+        if MCP_SHARED_KEY and method != "initialize":
+            key = request.headers.get("X-MCP-Key", "")
+            if key != MCP_SHARED_KEY:
+                return JSONResponse(
+                    {"jsonrpc":"2.0","id":_id,"error":{"code":-32001,"message":"Unauthorized"}},
+                    status_code=401
+                )
 
         if method == "initialize":
             client_proto = (payload.get("params") or {}).get("protocolVersion") or MCP_PROTO_DEFAULT
