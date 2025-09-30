@@ -53,12 +53,10 @@ def _new_ads_client(login_cid: Optional[str] = None) -> GoogleAdsClient:
     return GoogleAdsClient.load_from_dict(cfg)
 
 def _ga_search(svc, customer_id: str, query: str, page_size: Optional[int] = None, page_token: Optional[str] = None):
-    # Newer google-ads clients enforce a fixed server-side page size (10,000).
-    # Sending page_size causes INVALID_ARGUMENT. We therefore ignore it.
-    req = {"customer_id": customer_id, "query": query}
+    # Newer google-ads clients use a fixed server page size (10,000). Do not send page_size.
+    req = {"customer_id": str(customer_id), "query": query}
     if page_token:
         req["page_token"] = page_token
-    # Use your retry wrapper
     return _ads_call(lambda: svc.search(request=req))
 
 # ---------- FastAPI base ----------
@@ -183,9 +181,8 @@ def _refresh_account_cache(root_mcc: Optional[str]) -> None:
         WHERE customer_client.level <= 10
         """
         rows = _ads_call(lambda: svc.search(request={
-            "customer_id": str(root_mcc).replace("-",""),
+            "customer_id": str(root_mcc).replace("-", ""),
             "query": q
-            # server-fixed page size; do not set page_size
         }))
         local = {}
         for r in rows:
@@ -344,8 +341,8 @@ TOOLS = [
                 "time_range": {"type": "object", "properties": {"since": {"type": "string"}, "until": {"type": "string"}},
                     "description": "Explicit YYYY-MM-DD range (overrides date_preset)"},
                 "page_size":  {"type": "integer",
-                   "description": "DEPRECATED/IGNORED: Google Ads search uses a fixed server page size.",
-                   "minimum": 1, "maximum": 10000, "default": 1000},
+                    "description": "DEPRECATED/IGNORED: Google Ads search uses a fixed server page size.",
+                    "minimum": 1, "maximum": 10000, "default": 1000},
                 "page_token": {"type": ["string","null"]},
                 "login_customer_id": {"type": "string", "description": "Manager id for header (optional)"}
             }
@@ -479,8 +476,8 @@ def tool_fetch_account_tree(args: Dict[str, Any]) -> Dict[str, Any]:
     rows = _ads_call(lambda: svc.search(request={
         "customer_id": str(root),
         "query": q
-        # server-fixed page size; do not set page_size
     }))
+
     out = []
     for r in rows:
         cc = r.customer_client
@@ -531,7 +528,9 @@ def tool_fetch_metrics(args: Dict[str, Any]) -> Dict[str, Any]:
     req = {"customer_id": str(customer_id), "query": q}
     if page_token:
         req["page_token"] = page_token
+
     resp = _ads_call(lambda: svc.search(request=req))
+
     out_rows = []
     next_token = getattr(resp, "next_page_token", None)
     for r in resp:
@@ -595,8 +594,8 @@ def tool_fetch_campaign_summary(args: Dict[str, Any]) -> Dict[str, Any]:
     rows = _ads_call(lambda: svc.search(request={
         "customer_id": str(customer_id),
         "query": q
-        # server-fixed page size; do not set page_size
     }))
+
     out = []
     for r in rows:
         cost = _money(r.metrics.cost_micros)
@@ -647,8 +646,8 @@ def tool_list_recommendations(args: Dict[str, Any]) -> Dict[str, Any]:
     rows = _ads_call(lambda: svc.search(request={
         "customer_id": str(customer_id),
         "query": q
-        # server-fixed page size; do not set page_size
     }))
+
     out = []
     for r in rows:
         out.append({
@@ -690,8 +689,8 @@ def tool_fetch_search_terms(args: Dict[str, Any]) -> Dict[str, Any]:
     rows = _ads_call(lambda: svc.search(request={
         "customer_id": str(customer_id),
         "query": q
-        # server-fixed page size; do not set page_size
     }))
+
     out = []
     for r in rows:
         out.append({
@@ -735,8 +734,8 @@ def tool_fetch_change_history(args: Dict[str, Any]) -> Dict[str, Any]:
     rows = _ads_call(lambda: svc.search(request={
         "customer_id": str(customer_id),
         "query": q
-        # server-fixed page size; do not set page_size
     }))
+
     out = []
     for r in rows:
         out.append({
@@ -779,8 +778,8 @@ def tool_fetch_budget_pacing(args: Dict[str, Any]) -> Dict[str, Any]:
     rows = _ads_call(lambda: svc.search(request={
         "customer_id": str(customer_id),
         "query": q
-        # server-fixed page size; do not set page_size
     }))
+
     mtd_cost = 0
     for r in rows:
         mtd_cost += _money(r.metrics.cost_micros)
