@@ -27,7 +27,7 @@ DEV_TOKEN         = os.getenv("GOOGLE_ADS_DEVELOPER_TOKEN", "")
 CLIENT_ID         = os.getenv("GOOGLE_ADS_CLIENT_ID", "")
 CLIENT_SECRET     = os.getenv("GOOGLE_ADS_CLIENT_SECRET", "")
 REFRESH_TOKEN     = os.getenv("GOOGLE_ADS_REFRESH_TOKEN", "")
-LOGIN_CUSTOMER_ID = os.getenv("GOOGLE_ADS_LOGIN_CUSTOMER_ID", "").strip()  # <-- strip it
+LOGIN_CUSTOMER_ID = (os.getenv("GOOGLE_ADS_LOGIN_CUSTOMER_ID", "") or "").replace("-", "").strip()
 
 def _require_env():
     missing = [k for k,v in [
@@ -48,13 +48,12 @@ def _new_ads_client(login_cid: Optional[str] = None) -> GoogleAdsClient:
         "refresh_token": REFRESH_TOKEN,
         "use_proto_plus": True,
     }
-    # normalize incoming and env values
-    env_login = (LOGIN_CUSTOMER_ID or "").replace("-", "").strip()
-    arg_login = (login_cid or "").replace("-", "").strip() if login_cid else ""
-    final_login = arg_login or env_login
+    arg_login = (login_cid or "").replace("-", "").strip()
+    final_login = arg_login or LOGIN_CUSTOMER_ID
     if final_login:
         cfg["login_customer_id"] = final_login
-    log.info("GoogleAds login_customer_id in use: %r", cfg.get("login_customer_id", ""))  # DEBUG
+    log.info("GoogleAds login_customer_id in use: %r (arg=%r env=%r)",
+             cfg.get("login_customer_id", ""), arg_login, LOGIN_CUSTOMER_ID)
     return GoogleAdsClient.load_from_dict(cfg)
 
 def _ga_search(svc, customer_id: str, query: str, page_size: Optional[int] = None, page_token: Optional[str] = None):
@@ -281,8 +280,12 @@ def _ads_call(fn, attempts=5):
             details = {
                 "status": status,
                 "request_id": rid,
-                "errors": [{"message": err.message, "code": err.error_code.__class__.__name__} for err in (getattr(e, "failure", None).errors or [])] if getattr(e, "failure", None) else []
+                "errors": [{"message": err.message, "code": err.error_code.__class__.__name__}
+                           for err in (getattr(e, "failure", None).errors or [])] if getattr(e, "failure", None) else []
             }
+            if status == "PERMISSION_DENIED":
+                details["hint"] = ("Set login_customer_id to your MCC (e.g. 9000159936) "
+                                   "or configure GOOGLE_ADS_LOGIN_CUSTOMER_ID on the server.")
             raise RuntimeError(json.dumps(details))
 
 def _gaql_where_for_time(tnorm: Dict[str,str]) -> str:
@@ -455,6 +458,20 @@ TOOLS.append({
     "description": "Health check (public).",
     "inputSchema": {"type": "object", "properties": {}}
 })
+
+TOOLS.append({
+    "name": "debug_login_header",
+    "description": "Show which login_customer_id (MCC) the server will use.",
+    "inputSchema": {"type":"object","properties":{}}
+})
+
+def tool_debug_login_header(_args: Dict[str, Any]) -> Dict[str, Any]:
+    return {"env_LOGIN_CUSTOMER_ID": LOGIN_CUSTOMER_ID}
+
+# in tools/call dispatch:
+elif name == "debug_login_header":
+    data = tool_debug_login_header(args)
+    res  = mcp_ok_json("Debug login header", data)
 
 
 # ---------- Tool implementations ----------
