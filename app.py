@@ -643,42 +643,54 @@ async def rpc(request: Request):
     try:
         payload = await request.json()
         _id     = payload.get("id")
+        method  = (payload.get("method") or "").lower()
 
-        # Auth AFTER we know _id
-        if MCP_SHARED_KEY:
-            key = request.headers.get("X-MCP-Key", "")
-            if key != MCP_SHARED_KEY:
+        # Accept both X-MCP-Key and Authorization: Bearer <token>
+        def _get_shared_key(req: Request) -> str:
+            auth = req.headers.get("Authorization", "")
+            if auth.lower().startswith("bearer "):
+                return auth.split(" ", 1)[1].strip()
+            return req.headers.get("X-MCP-Key", "")
+
+        # Handshake-friendly auth: allow initialize/initialized without key
+        if MCP_SHARED_KEY and method not in ("initialize", "initialized", "notifications/initialized"):
+            if _get_shared_key(request) != MCP_SHARED_KEY:
                 return JSONResponse(
                     {"jsonrpc": "2.0", "id": _id,
                      "error": {"code": -32001, "message": "Unauthorized"}},
-                    status_code=401
+                    status_code=401,
+                    headers={"MCP-Protocol-Version": request.headers.get("MCP-Protocol-Version", MCP_PROTO_DEFAULT)}
                 )
 
-        method  = (payload.get("method") or "").lower()
-
-        if MCP_SHARED_KEY and method != "initialize":
-            key = request.headers.get("X-MCP-Key", "")
-            if key != MCP_SHARED_KEY:
-                return JSONResponse(
-                    {"jsonrpc":"2.0","id":_id,"error":{"code":-32001,"message":"Unauthorized"}},
-                    status_code=401
-                )
-
+        # initialize
         if method == "initialize":
             client_proto = (payload.get("params") or {}).get("protocolVersion") or MCP_PROTO_DEFAULT
-            result = {"protocolVersion": client_proto,
-                      "capabilities": {"tools": {"listChanged": True}},
-                      "serverInfo": {"name": APP_NAME, "version": APP_VER},
-                      "tools": TOOLS}
-            return JSONResponse({"jsonrpc":"2.0","id":_id,"result":result},
-                                headers={"MCP-Protocol-Version": client_proto})
+            result = {
+                "protocolVersion": client_proto,
+                "capabilities": {"tools": {"listChanged": True}},
+                "serverInfo": {"name": APP_NAME, "version": APP_VER},
+                "tools": TOOLS
+            }
+            return JSONResponse(
+                {"jsonrpc": "2.0", "id": _id, "result": result},
+                headers={"MCP-Protocol-Version": client_proto}
+            )
 
-        if method in ("initialized","notifications/initialized"):
-            return JSONResponse({"jsonrpc":"2.0","id":_id,"result":{"ok": True}})
+        # initialized notification
+        if method in ("initialized", "notifications/initialized"):
+            return JSONResponse(
+                {"jsonrpc": "2.0", "id": _id, "result": {"ok": True}},
+                headers={"MCP-Protocol-Version": request.headers.get("MCP-Protocol-Version", MCP_PROTO_DEFAULT)}
+            )
 
-        if method in ("tools/list","tools.list","list_tools","tools.index"):
-            return JSONResponse({"jsonrpc":"2.0","id":_id,"result":{"tools": TOOLS}})
+        # list tools
+        if method in ("tools/list", "tools.list", "list_tools", "tools.index"):
+            return JSONResponse(
+                {"jsonrpc": "2.0", "id": _id, "result": {"tools": TOOLS}},
+                headers={"MCP-Protocol-Version": request.headers.get("MCP-Protocol-Version", MCP_PROTO_DEFAULT)}
+            )
 
+        # call a tool
         if method == "tools/call":
             params = payload.get("params") or {}
             name   = params.get("name")
@@ -687,47 +699,69 @@ async def rpc(request: Request):
             try:
                 if name == "fetch_account_tree":
                     data = tool_fetch_account_tree(args)
-                    return JSONResponse({"jsonrpc":"2.0","id":_id,"result": mcp_ok_json("Account tree", data)})
-                if name == "fetch_metrics":
+                    res  = mcp_ok_json("Account tree", data)
+                elif name == "fetch_metrics":
                     data = tool_fetch_metrics(args)
-                    return JSONResponse({"jsonrpc":"2.0","id":_id,"result": mcp_ok_json("Metrics", data)})
-                if name == "fetch_campaign_summary":
+                    res  = mcp_ok_json("Metrics", data)
+                elif name == "fetch_campaign_summary":
                     data = tool_fetch_campaign_summary(args)
-                    return JSONResponse({"jsonrpc":"2.0","id":_id,"result": mcp_ok_json("Campaign summary", data)})
-                if name == "list_recommendations":
+                    res  = mcp_ok_json("Campaign summary", data)
+                elif name == "list_recommendations":
                     data = tool_list_recommendations(args)
-                    return JSONResponse({"jsonrpc":"2.0","id":_id,"result": mcp_ok_json("Recommendations", data)})
-                if name == "fetch_search_terms":
+                    res  = mcp_ok_json("Recommendations", data)
+                elif name == "fetch_search_terms":
                     data = tool_fetch_search_terms(args)
-                    return JSONResponse({"jsonrpc":"2.0","id":_id,"result": mcp_ok_json("Search terms", data)})
-                if name == "fetch_change_history":
+                    res  = mcp_ok_json("Search terms", data)
+                elif name == "fetch_change_history":
                     data = tool_fetch_change_history(args)
-                    return JSONResponse({"jsonrpc":"2.0","id":_id,"result": mcp_ok_json("Change history", data)})
-                if name == "fetch_budget_pacing":
+                    res  = mcp_ok_json("Change history", data)
+                elif name == "fetch_budget_pacing":
                     data = tool_fetch_budget_pacing(args)
-                    return JSONResponse({"jsonrpc":"2.0","id":_id,"result": mcp_ok_json("Budget pacing", data)})
+                    res  = mcp_ok_json("Budget pacing", data)
+                else:
+                    return JSONResponse(
+                        {"jsonrpc": "2.0", "id": _id,
+                         "error": {"code": -32601, "message": f"Unknown tool: {name}"}},
+                        headers={"MCP-Protocol-Version": request.headers.get("MCP-Protocol-Version", MCP_PROTO_DEFAULT)}
+                    )
 
-                return JSONResponse({"jsonrpc":"2.0","id":_id,
-                    "error":{"code":-32601,"message":f"Unknown tool: {name}"}})
+                return JSONResponse(
+                    {"jsonrpc": "2.0", "id": _id, "result": res},
+                    headers={"MCP-Protocol-Version": request.headers.get("MCP-Protocol-Version", MCP_PROTO_DEFAULT)}
+                )
+
             except ValueError as ve:
-                return JSONResponse({"jsonrpc":"2.0","id":_id,
-                    "error":{"code":-32602,"message":f"Invalid params: {ve}"}})
+                return JSONResponse(
+                    {"jsonrpc": "2.0", "id": _id,
+                     "error": {"code": -32602, "message": f"Invalid params: {ve}"}},
+                    headers={"MCP-Protocol-Version": request.headers.get("MCP-Protocol-Version", MCP_PROTO_DEFAULT)}
+                )
             except Exception as e:
                 log.exception("Tool call failed")
-                # Bubble a uniform error envelope
                 try:
                     data = json.loads(str(e))
                 except Exception:
                     data = {"detail": str(e)}
-                return JSONResponse({"jsonrpc":"2.0","id":_id,
-                    "error": mcp_err("Google Ads API error", data)})
+                return JSONResponse(
+                    {"jsonrpc": "2.0", "id": _id,
+                     "error": mcp_err("Google Ads API error", data)},
+                    headers={"MCP-Protocol-Version": request.headers.get("MCP-Protocol-Version", MCP_PROTO_DEFAULT)}
+                )
 
-        return JSONResponse({"jsonrpc":"2.0","id":_id,
-                             "error":{"code":-32601,"message":f"Method not found: {method}"}})
+        # unknown method
+        return JSONResponse(
+            {"jsonrpc": "2.0", "id": _id,
+             "error": {"code": -32601, "message": f"Method not found: {method}"}},
+            headers={"MCP-Protocol-Version": request.headers.get("MCP-Protocol-Version", MCP_PROTO_DEFAULT)}
+        )
+
     except Exception as e:
         log.exception("RPC dispatch error")
-        return JSONResponse({"jsonrpc":"2.0","id":None,
-                             "error":{"code":-32098,"message":f"RPC dispatch error: {e}"}})
+        return JSONResponse(
+            {"jsonrpc": "2.0", "id": None,
+             "error": {"code": -32098, "message": f"RPC dispatch error: {e}"}},
+            headers={"MCP-Protocol-Version": request.headers.get("MCP-Protocol-Version", MCP_PROTO_DEFAULT)}
+        )
 
 # ---------- Local dev ----------
 if __name__ == "__main__":
