@@ -72,23 +72,34 @@ class MCPProtocolHeader(BaseHTTPMiddleware):
 
 app.add_middleware(MCPProtocolHeader)
 
+from starlette.types import Message
+
 class RPCAudit(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         if request.url.path == "/" and request.method == "POST":
+            body_bytes = await request.body()  # read once
+            # Re-inject the body for downstream
+            async def receive() -> Message:
+                return {"type": "http.request", "body": body_bytes, "more_body": False}
+            request._receive = receive  # Starlette internals: safe override
+
+            method = "unknown"
             try:
-                body = await request.json()
+                payload = json.loads(body_bytes.decode("utf-8") or "{}")
+                method = "batch" if isinstance(payload, list) else (payload.get("method") or "").lower()
             except Exception:
-                body = {}
-            # Determine method (or 'batch')
-            method = "batch" if isinstance(body, list) else (body.get("method") or "").lower()
+                pass
+
             ua = request.headers.get("user-agent","")
             has_x = "X-MCP-Key" in request.headers
             auth = request.headers.get("authorization","")
             has_bearer = auth.lower().startswith("bearer ")
             log.warning("RPC method=%s ua=%s key:x=%s bearer=%s", method, ua, has_x, has_bearer)
+
         return await call_next(request)
 
 app.add_middleware(RPCAudit)
+
 
 # ---------- MCP tooling ----------
 def mcp_ok_json(title: str, data: Any) -> Dict[str, Any]:
