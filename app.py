@@ -48,8 +48,13 @@ def _new_ads_client(login_cid: Optional[str] = None) -> GoogleAdsClient:
         "refresh_token": REFRESH_TOKEN,
         "use_proto_plus": True,
     }
-    if login_cid or LOGIN_CUSTOMER_ID:
-        cfg["login_customer_id"] = (login_cid or LOGIN_CUSTOMER_ID).replace("-", "")
+    # normalize incoming and env values
+    env_login = (LOGIN_CUSTOMER_ID or "").replace("-", "").strip()
+    arg_login = (login_cid or "").replace("-", "").strip() if login_cid else ""
+    final_login = arg_login or env_login
+    if final_login:
+        cfg["login_customer_id"] = final_login
+    log.info("GoogleAds login_customer_id in use: %r", cfg.get("login_customer_id", ""))  # DEBUG
     return GoogleAdsClient.load_from_dict(cfg)
 
 def _ga_search(svc, customer_id: str, query: str, page_size: Optional[int] = None, page_token: Optional[str] = None):
