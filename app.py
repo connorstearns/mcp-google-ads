@@ -6,6 +6,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.types import Message
 
 # Google Ads
 from google.ads.googleads.client import GoogleAdsClient
@@ -72,16 +73,15 @@ class MCPProtocolHeader(BaseHTTPMiddleware):
 
 app.add_middleware(MCPProtocolHeader)
 
-from starlette.types import Message
-
 class RPCAudit(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         if request.url.path == "/" and request.method == "POST":
             body_bytes = await request.body()  # read once
-            # Re-inject the body for downstream
+
+            # Re-inject the body for downstream handlers
             async def receive() -> Message:
                 return {"type": "http.request", "body": body_bytes, "more_body": False}
-            request._receive = receive  # Starlette internals: safe override
+            request._receive = receive  # Starlette-safe
 
             method = "unknown"
             try:
@@ -99,6 +99,7 @@ class RPCAudit(BaseHTTPMiddleware):
         return await call_next(request)
 
 app.add_middleware(RPCAudit)
+
 
 
 # ---------- MCP tooling ----------
@@ -425,8 +426,16 @@ TOOLS = [
         }
     }
 ]
+TOOLS.append({
+    "name": "ping",
+    "description": "Health check (public).",
+    "inputSchema": {"type":"object","properties":{}}
+})
 
 # ---------- Tool implementations ----------
+def tool_ping(args: Dict[str, Any]) -> Dict[str, Any]:
+    return {"ok": True, "time": datetime.datetime.utcnow().isoformat() + "Z"}
+
 def tool_fetch_account_tree(args: Dict[str, Any]) -> Dict[str, Any]:
     root = args["root_customer_id"].replace("-", "")
     depth = int(args.get("depth", 2))
@@ -767,7 +776,12 @@ def favicon_svg(): return Response(status_code=204)
 def mcp_discovery():
     auth = {"type": "none"}
     if MCP_SHARED_KEY:
-        auth = {"type": "shared-secret", "tokenHeader": "X-MCP-Key"}
+        auth = {
+            "type": "shared-secret",
+            "tokenHeader": "Authorization",  # prefer Bearer
+            "scheme": "Bearer",
+            "altHeaders": ["X-MCP-Key"]     # optional hint
+        }
     return JSONResponse({
         "mcpVersion": MCP_PROTO_DEFAULT,
         "name": APP_NAME,
@@ -777,6 +791,7 @@ def mcp_discovery():
         "endpoints": {"rpc": "/"},
         "tools": TOOLS
     })
+
 
 @app.get("/mcp/tools")
 def mcp_tools():
@@ -796,16 +811,43 @@ async def rpc(request: Request):
             if auth.lower().startswith("bearer "):
                 return auth.split(" ", 1)[1].strip()
             return req.headers.get("X-MCP-Key", "")
-
-        # Handshake-friendly auth: allow initialize/initialized without key
-        if MCP_SHARED_KEY and method not in ("initialize", "initialized", "notifications/initialized"):
-            if _get_shared_key(request) != MCP_SHARED_KEY:
-                return JSONResponse(
-                    {"jsonrpc": "2.0", "id": _id,
-                     "error": {"code": -32001, "message": "Unauthorized"}},
-                    status_code=401,
-                    headers={"MCP-Protocol-Version": request.headers.get("MCP-Protocol-Version", MCP_PROTO_DEFAULT)}
-                )
+        
+        public_methods = {
+            "initialize",
+            "initialized",
+            "notifications/initialized",
+            # Allow listing tools without auth (client may use any of these variants)
+            "tools/list", "tools.list", "list_tools", "tools.index",
+        }
+        public_tools = {"ping"}  # safe public tool
+        
+        if MCP_SHARED_KEY:
+            if method not in public_methods:
+                if method == "tools/call":
+                    params = (payload.get("params") or {})
+                    tool_name = (params.get("name") or "").lower()
+                    if tool_name not in public_tools:
+                        if _get_shared_key(request) != MCP_SHARED_KEY:
+                            return JSONResponse(
+                                {"jsonrpc": "2.0", "id": _id,
+                                 "error": {"code": -32001, "message": "Unauthorized"}},
+                                status_code=401,
+                                headers={
+                                    "MCP-Protocol-Version": request.headers.get("MCP-Protocol-Version", MCP_PROTO_DEFAULT),
+                                    "WWW-Authenticate": 'Bearer realm="mcp-google-ads"'
+                                }
+                            )
+                else:
+                    if _get_shared_key(request) != MCP_SHARED_KEY:
+                        return JSONResponse(
+                            {"jsonrpc": "2.0", "id": _id,
+                             "error": {"code": -32001, "message": "Unauthorized"}},
+                            status_code=401,
+                            headers={
+                                "MCP-Protocol-Version": request.headers.get("MCP-Protocol-Version", MCP_PROTO_DEFAULT),
+                                "WWW-Authenticate": 'Bearer realm="mcp-google-ads"'
+                            }
+                        )
 
         # initialize
         if method == "initialize":
@@ -863,9 +905,10 @@ async def rpc(request: Request):
                 elif name == "fetch_budget_pacing":
                     data = tool_fetch_budget_pacing(args)
                     res  = mcp_ok_json("Budget pacing", data)
-                elif name == "resolve_customer":
-                    data = tool_resolve_customer(args)
-                    res  = mcp_ok_json("Resolved customer", data)
+                # ↓ paste this ping branch here
+                elif name == "ping":
+                    data = tool_ping(args)
+                    res  = mcp_ok_json("pong", data)
                 else:
                     return JSONResponse(
                         {"jsonrpc": "2.0", "id": _id,
