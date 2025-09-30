@@ -55,7 +55,7 @@ def _new_ads_client(login_cid: Optional[str] = None) -> GoogleAdsClient:
 def _ga_search(svc, customer_id: str, query: str, page_size: Optional[int] = None, page_token: Optional[str] = None):
     # Newer google-ads clients enforce a fixed server-side page size (10,000).
     # Sending page_size causes INVALID_ARGUMENT. We therefore ignore it.
-+    req = {"customer_id": customer_id, "query": query}
+    req = {"customer_id": customer_id, "query": query}
     if page_token:
         req["page_token"] = page_token
     # Use your retry wrapper
