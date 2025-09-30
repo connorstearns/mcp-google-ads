@@ -1,5 +1,5 @@
 import os, json, time, random, logging, datetime, re
-from typing import Dict, Any, Optional, List, Tuple
+from typing import Dict, Any, Optional, List, Tuple, Set
 from difflib import get_close_matches
 
 from fastapi import FastAPI, Request
@@ -859,6 +859,116 @@ def mcp_discovery():
 def mcp_tools():
     return JSONResponse({"tools": TOOLS})
 
+def _build_jsonrpc_error(_id: Any, code: int, message: str, data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    body: Dict[str, Any] = {"jsonrpc": "2.0", "id": _id, "error": {"code": code, "message": message}}
+    if data is not None:
+        body["error"]["data"] = data
+    return body
+
+
+def _handle_single_rpc(
+    obj: Any,
+    request: Request,
+    headers: Dict[str, str],
+    status: Dict[str, int],
+    public_tools: Set[str],
+) -> Optional[Dict[str, Any]]:
+    if not isinstance(obj, dict):
+        return _build_jsonrpc_error(None, -32600, "Invalid Request")
+
+    payload = obj
+    is_notification = ("id" not in payload and payload.get("jsonrpc") == "2.0" and "method" in payload)
+    _id = payload.get("id")
+    method = (payload.get("method") or "").lower()
+
+    require_key = bool(MCP_SHARED_KEY)
+
+    if require_key and method == "tools/call":
+        params = (payload.get("params") or {})
+        tool_name = (params.get("name") or "").lower()
+        if tool_name not in public_tools:
+            auth_hdr = request.headers.get("Authorization", "")
+            has_bearer = auth_hdr.lower().startswith("bearer ")
+            bearer_ok = has_bearer and auth_hdr.split(" ", 1)[1].strip() == MCP_SHARED_KEY
+            has_xhdr = "X-MCP-Key" in request.headers
+            xhdr_ok = request.headers.get("X-MCP-Key", "") == MCP_SHARED_KEY
+
+            if not (bearer_ok or xhdr_ok):
+                log.warning("401 on tools/call tool=%s has_bearer=%s has_xmcp=%s", tool_name, has_bearer, has_xhdr)
+                status["code"] = 401
+                headers["WWW-Authenticate"] = 'Bearer realm="mcp-google-ads"'
+                if is_notification:
+                    return None
+                return _build_jsonrpc_error(_id, -32001, "Unauthorized")
+
+    def success(result: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if is_notification:
+            return None
+        return {"jsonrpc": "2.0", "id": _id, "result": result}
+
+    def error(code: int, message: str, data: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+        if is_notification:
+            return None
+        return _build_jsonrpc_error(_id, code, message, data)
+
+    if method == "initialize":
+        client_proto = (payload.get("params") or {}).get("protocolVersion") or MCP_PROTO_DEFAULT
+        headers["MCP-Protocol-Version"] = client_proto
+        result = {
+            "protocolVersion": client_proto,
+            "capabilities": {"tools": {"listChanged": True}},
+            "serverInfo": {"name": APP_NAME, "version": APP_VER},
+            "tools": TOOLS
+        }
+        return success(result)
+
+    if method in ("initialized", "notifications/initialized"):
+        return success({"ok": True})
+
+    if method in ("tools/list", "tools.list", "list_tools", "tools.index"):
+        return success({"tools": TOOLS})
+
+    if method == "tools/call":
+        params = payload.get("params") or {}
+        name = params.get("name")
+        args = params.get("arguments") or {}
+        try:
+            if name == "fetch_account_tree":
+                data = tool_fetch_account_tree(args); res = mcp_ok_json("Account tree", data)
+            elif name == "fetch_metrics":
+                data = tool_fetch_metrics(args); res = mcp_ok_json("Metrics", data)
+            elif name == "fetch_campaign_summary":
+                data = tool_fetch_campaign_summary(args); res = mcp_ok_json("Campaign summary", data)
+            elif name == "list_recommendations":
+                data = tool_list_recommendations(args); res = mcp_ok_json("Recommendations", data)
+            elif name == "fetch_search_terms":
+                data = tool_fetch_search_terms(args); res = mcp_ok_json("Search terms", data)
+            elif name == "fetch_change_history":
+                data = tool_fetch_change_history(args); res = mcp_ok_json("Change history", data)
+            elif name == "fetch_budget_pacing":
+                data = tool_fetch_budget_pacing(args); res = mcp_ok_json("Budget pacing", data)
+            elif name == "ping":
+                data = tool_ping(args); res = mcp_ok_json("pong", data)
+            elif name == "debug_login_header":
+                data = tool_debug_login_header(args); res = mcp_ok_json("Debug login header", data)
+            else:
+                return error(-32601, f"Unknown tool: {name}")
+            return success(res)
+        except ValueError as ve:
+            return error(-32602, f"Invalid params: {ve}")
+        except Exception as e:
+            log.exception("Tool call failed")
+            try:
+                data = json.loads(str(e))
+            except Exception:
+                data = {"detail": str(e)}
+            if is_notification:
+                return None
+            return {"jsonrpc": "2.0", "id": _id, "error": mcp_err("Google Ads API error", data)}
+
+    return error(-32601, f"Method not found: {method}")
+
+
 # ---------- JSON-RPC ----------
 @app.post("/")
 async def rpc(request: Request):
@@ -866,158 +976,23 @@ async def rpc(request: Request):
     headers: Dict[str, str] = {"MCP-Protocol-Version": proto_header}
     status = {"code": 200}
 
-    # make debug tool callable even with shared key if you want; add/remove here
-    public_tools = {"ping", "debug_login_header"}
-
-    def build_error(_id, code: int, message: str, data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        body: Dict[str, Any] = {"jsonrpc": "2.0", "id": _id, "error": {"code": code, "message": message}}
-        if data is not None:
-            body["error"]["data"] = data
-        return body
-
-    def handle_single_rpc(obj: Any) -> Optional[Dict[str, Any]]:
-        nonlocal headers, status
-
-        if not isinstance(obj, dict):
-            return build_error(None, -32600, "Invalid Request")
-
-        payload = obj
-        is_notification = ("id" not in payload and payload.get("jsonrpc") == "2.0" and "method" in payload)
-        _id = payload.get("id")
-        method = (payload.get("method") or "").lower()
-
-        require_key = bool(MCP_SHARED_KEY)
-
-        if require_key and method == "tools/call":
-            params = (payload.get("params") or {})
-            tool_name = (params.get("name") or "").lower()
-            if tool_name not in public_tools:
-                # Accept either Authorization: Bearer <key> OR X-MCP-Key: <key>
-                auth_hdr = request.headers.get("Authorization", "")
-                has_bearer = auth_hdr.lower().startswith("bearer ")
-                bearer_ok = has_bearer and auth_hdr.split(" ", 1)[1].strip() == MCP_SHARED_KEY
-                has_xhdr = "X-MCP-Key" in request.headers
-                xhdr_ok = request.headers.get("X-MCP-Key", "") == MCP_SHARED_KEY
-
-                if not (bearer_ok or xhdr_ok):
-                    log.warning(
-                        "401 on tools/call tool=%s has_bearer=%s has_xmcp=%s",
-                        tool_name, has_bearer, has_xhdr
-                    )
-                    status["code"] = 401
-                    headers["WWW-Authenticate"] = 'Bearer realm="mcp-google-ads"'
-                    if is_notification:
-                        return None
-                    return build_error(_id, -32001, "Unauthorized")
-        # NOTE: all other methods (initialize, tools/list variants, etc.) never require auth.
-
-        def success(result: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-            if is_notification:
-                return None
-            return {"jsonrpc": "2.0", "id": _id, "result": result}
-
-        def error(code: int, message: str, data: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
-            if is_notification:
-                return None
-            return build_error(_id, code, message, data)
-
-        # initialize
-        if method == "initialize":
-            client_proto = (payload.get("params") or {}).get("protocolVersion") or MCP_PROTO_DEFAULT
-            headers["MCP-Protocol-Version"] = client_proto
-            result = {
-                "protocolVersion": client_proto,
-                "capabilities": {"tools": {"listChanged": True}},
-                "serverInfo": {"name": APP_NAME, "version": APP_VER},
-                "tools": TOOLS
-            }
-            return success(result)
-
-        # initialized notification
-        if method in ("initialized", "notifications/initialized"):
-            return success({"ok": True})
-
-        # list tools
-        if method in ("tools/list", "tools.list", "list_tools", "tools.index"):
-            return success({"tools": TOOLS})
-
-        # call a tool
-        if method == "tools/call":
-            params = payload.get("params") or {}
-            name = params.get("name")
-            args = params.get("arguments") or {}
-
-            try:
-                if name == "fetch_account_tree":
-                    data = tool_fetch_account_tree(args)
-                    res = mcp_ok_json("Account tree", data)
-                elif name == "fetch_metrics":
-                    data = tool_fetch_metrics(args)
-                    res = mcp_ok_json("Metrics", data)
-                elif name == "fetch_campaign_summary":
-                    data = tool_fetch_campaign_summary(args)
-                    res = mcp_ok_json("Campaign summary", data)
-                elif name == "list_recommendations":
-                    data = tool_list_recommendations(args)
-                    res = mcp_ok_json("Recommendations", data)
-                elif name == "fetch_search_terms":
-                    data = tool_fetch_search_terms(args)
-                    res = mcp_ok_json("Search terms", data)
-                elif name == "fetch_change_history":
-                    data = tool_fetch_change_history(args)
-                    res = mcp_ok_json("Change history", data)
-                elif name == "fetch_budget_pacing":
-                    data = tool_fetch_budget_pacing(args)
-                    res = mcp_ok_json("Budget pacing", data)
-                elif name == "ping":
-                    data = tool_ping(args)
-                    res = mcp_ok_json("pong", data)
-                elif name == "debug_login_header":
-                    data = tool_debug_login_header(args)
-                    res = mcp_ok_json("Debug login header", data)
-                else:
-                    return error(-32601, f"Unknown tool: {name}")
-
-                return success(res)
-
-            except ValueError as ve:
-                return error(-32602, f"Invalid params: {ve}")
-            except Exception as e:
-                log.exception("Tool call failed")
-                try:
-                    data = json.loads(str(e))
-                except Exception:
-                    data = {"detail": str(e)}
-                if is_notification:
-                    return None
-                return {
-                    "jsonrpc": "2.0",
-                    "id": _id,
-                    "error": mcp_err("Google Ads API error", data)
-                }
-
-        # unknown method
-        return error(-32601, f"Method not found: {method}")
+    public_tools: Set[str] = {"ping"}
 
     try:
         payload = await request.json()
         if isinstance(payload, list):
             responses: List[Dict[str, Any]] = []
             for entry in payload:
-                resp = handle_single_rpc(entry)
+                resp = _handle_single_rpc(entry, request, headers, status, public_tools)
                 if resp is None:
                     continue
                 responses.append(resp)
             if responses:
-                return JSONResponse(
-                    responses,
-                    status_code=status["code"],
-                    headers=headers
-                )
+                return JSONResponse(responses, status_code=status["code"], headers=headers)
             status_code = status["code"] if status["code"] != 200 else 204
             return Response(status_code=status_code, headers=headers)
 
-        resp = handle_single_rpc(payload)
+        resp = _handle_single_rpc(payload, request, headers, status, public_tools)
         if resp is not None:
             return JSONResponse(resp, status_code=status["code"], headers=headers)
         status_code = status["code"] if status["code"] != 200 else 204
@@ -1026,10 +1001,10 @@ async def rpc(request: Request):
     except Exception as e:
         log.exception("RPC dispatch error")
         return JSONResponse(
-            {"jsonrpc": "2.0", "id": None,
-             "error": {"code": -32098, "message": f"RPC dispatch error: {e}"}},
+            {"jsonrpc": "2.0", "id": None, "error": {"code": -32098, "message": f"RPC dispatch error: {e}"}},
             headers=headers
         )
+
 
 # ---------- Local dev ----------
 if __name__ == "__main__":
