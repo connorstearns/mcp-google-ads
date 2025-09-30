@@ -437,6 +437,19 @@ TOOLS = [
         }
     },
     {
+        "name": "list_resources",
+        "description": "List accessible Google Ads customer accounts for the authenticated user.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "login_customer_id": {
+                    "type": "string",
+                    "description": "Optional manager (MCC) header override"
+                }
+            }
+        }
+    },
+    {
         "name": "resolve_customer",
         "description": "Resolve a client name or alias (or raw ID) to a normalized customer_id.",
         "inputSchema": {
@@ -813,6 +826,25 @@ def tool_fetch_budget_pacing(args: Dict[str, Any]) -> Dict[str, Any]:
         "query": q
     }
 
+def tool_list_resources(args: Dict[str, Any]) -> Dict[str, Any]:
+    login = (args.get("login_customer_id") or LOGIN_CUSTOMER_ID or "").replace("-", "") or None
+    client = _new_ads_client(login_cid=login)
+    svc = client.get_service("CustomerService")
+    response = _ads_call(lambda: svc.list_accessible_customers())
+
+    customers: List[Dict[str, str]] = []
+    for resource_name in response.resource_names:
+        customer_id = resource_name.split("/")[-1]
+        customers.append({
+            "resource_name": resource_name,
+            "customer_id": customer_id,
+        })
+
+    return {
+        "count": len(customers),
+        "customers": customers,
+    }
+
 def tool_resolve_customer(args: Dict[str, Any]) -> Dict[str, Any]:
     login = (args.get("login_customer_id") or LOGIN_CUSTOMER_ID or "").replace("-", "") or None
     target = args["customer"]
@@ -947,6 +979,8 @@ def _handle_single_rpc(
                 data = tool_fetch_change_history(args); res = mcp_ok_json("Change history", data)
             elif name == "fetch_budget_pacing":
                 data = tool_fetch_budget_pacing(args); res = mcp_ok_json("Budget pacing", data)
+            elif name == "list_resources":
+                data = tool_list_resources(args); res = mcp_ok_json("Resources", data)
             elif name == "ping":
                 data = tool_ping(args); res = mcp_ok_json("pong", data)
             elif name == "debug_login_header":
@@ -976,7 +1010,7 @@ async def rpc(request: Request):
     headers: Dict[str, str] = {"MCP-Protocol-Version": proto_header}
     status = {"code": 200}
 
-    public_tools: Set[str] = {"ping"}
+    public_tools: Set[str] = {"ping", "list_resources"}
 
     try:
         payload = await request.json()
