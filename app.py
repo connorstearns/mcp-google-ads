@@ -72,6 +72,24 @@ class MCPProtocolHeader(BaseHTTPMiddleware):
 
 app.add_middleware(MCPProtocolHeader)
 
+class RPCAudit(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        if request.url.path == "/" and request.method == "POST":
+            try:
+                body = await request.json()
+            except Exception:
+                body = {}
+            # Determine method (or 'batch')
+            method = "batch" if isinstance(body, list) else (body.get("method") or "").lower()
+            ua = request.headers.get("user-agent","")
+            has_x = "X-MCP-Key" in request.headers
+            auth = request.headers.get("authorization","")
+            has_bearer = auth.lower().startswith("bearer ")
+            log.warning("RPC method=%s ua=%s key:x=%s bearer=%s", method, ua, has_x, has_bearer)
+        return await call_next(request)
+
+app.add_middleware(RPCAudit)
+
 # ---------- MCP tooling ----------
 def mcp_ok_json(title: str, data: Any) -> Dict[str, Any]:
     # Dual payload: JSON (machine) + text (human)
