@@ -843,13 +843,14 @@ async def rpc(request: Request):
                 auth_hdr = request.headers.get("Authorization", "")
                 bearer_ok = auth_hdr.lower().startswith("bearer ") and auth_hdr.split(" ", 1)[1].strip() == MCP_SHARED_KEY
                 xhdr_ok = request.headers.get("X-MCP-Key", "") == MCP_SHARED_KEY
+                
                 if not (bearer_ok or xhdr_ok):
-                log.warning(
-                    "401 on tools/call tool=%s has_bearer=%s has_xmcp=%s",
-                    tool_name,
-                    request.headers.get("Authorization","").lower().startswith("bearer "),
-                    "X-MCP-Key" in request.headers
-                )
+                    log.warning(
+                        "401 on tools/call tool=%s has_bearer=%s has_xmcp=%s",
+                        tool_name,
+                        request.headers.get("Authorization","").lower().startswith("bearer "),
+                        "X-MCP-Key" in request.headers
+                    )
                     return _unauth(_id)
         # NOTE: all other methods (initialize, tools/list variants, etc.) never require auth.
 
