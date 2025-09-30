@@ -1,8 +1,9 @@
-import os, json, time, random, logging, datetime
+import os, json, time, random, logging, datetime, re
 from typing import Dict, Any, Optional, List, Tuple
+from difflib import get_close_matches
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 
@@ -44,7 +45,6 @@ def _new_ads_client(login_cid: Optional[str] = None) -> GoogleAdsClient:
         "client_id": CLIENT_ID,
         "client_secret": CLIENT_SECRET,
         "refresh_token": REFRESH_TOKEN,
-        # login_customer_id optional; can also be provided per-call header
     }
     if login_cid or LOGIN_CUSTOMER_ID:
         cfg["login_customer_id"] = (login_cid or LOGIN_CUSTOMER_ID).replace("-", "")
@@ -65,7 +65,7 @@ app.add_middleware(
 
 class MCPProtocolHeader(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        proto = request.headers.get("Mcp-Protocol-Version") or MCP_PROTO_DEFAULT
+        proto = request.headers.get("MCP-Protocol-Version") or MCP_PROTO_DEFAULT
         response = await call_next(request)
         response.headers["MCP-Protocol-Version"] = proto
         return response
@@ -86,117 +86,7 @@ def mcp_err(message: str, data: Optional[Dict[str, Any]] = None) -> Dict[str, An
         out["data"] = data
     return {"code": -32000, "message": message, "data": data or {}}
 
-TOOLS = [
-    {
-        "name": "fetch_account_tree",
-        "description": "List accessible customer hierarchy (manager → clients).",
-        "inputSchema": {
-            "type":"object",
-            "properties":{
-                "root_customer_id":{"type":"string","description":"Manager (MCC) customer id, digits only"},
-                "depth":{"type":"integer","minimum":1,"maximum":10,"default":2}
-            },
-            "required":["root_customer_id"]
-        }
-    },
-    {
-        "name": "fetch_metrics",
-        "description": "Generic metrics for account/campaign/ad_group/ad with optional segments.",
-        "inputSchema": {
-            "type":"object",
-            "properties":{
-                "customer_id":{"type":"string"},
-                "entity":{"type":"string","enum":["account","campaign","ad_group","ad"],"default":"campaign"},
-                "ids":{"type":"array","items":{"type":"string"}},
-                "fields":{"type":"array","items":{"type":"string"},
-                    "default":["metrics.cost_micros","metrics.clicks","metrics.impressions","metrics.conversions","metrics.conversions_value"]},
-                "segments":{"type":"array","items":{"type":"string"},
-                    "description":"e.g. date, device, network"},
-                "date_preset":{"type":"string","description":"TODAY|YESTERDAY|LAST_7_DAYS|LAST_30_DAYS|THIS_MONTH|LAST_MONTH"},
-                "time_range":{"type":"object","properties":{"since":{"type":"string"},"until":{"type":"string"}}},
-                "page_size":{"type":"integer","minimum":1,"maximum":10000,"default":1000},
-                "page_token":{"type":["string","null"]},
-                "login_customer_id":{"type":"string","description":"Manager id for header (optional)"}
-            },
-            "required":["customer_id"]
-        }
-    },
-    {
-        "name": "fetch_campaign_summary",
-        "description": "Per-campaign KPIs with computed ctr/cpc/cpa/roas.",
-        "inputSchema": {
-            "type":"object",
-            "properties":{
-                "customer_id":{"type":"string"},
-                "date_preset":{"type":"string"},
-                "time_range":{"type":"object","properties":{"since":{"type":"string"},"until":{"type":"string"}}},
-                "login_customer_id":{"type":"string"}
-            },
-            "required":["customer_id"]
-        }
-    },
-    {
-        "name": "list_recommendations",
-        "description": "Google Ads Recommendations for a customer.",
-        "inputSchema": {
-            "type":"object",
-            "properties":{
-                "customer_id":{"type":"string"},
-                "types":{"type":"array","items":{"type":"string"}},
-                "login_customer_id":{"type":"string"}
-            },
-            "required":["customer_id"]
-        }
-    },
-    {
-        "name": "fetch_search_terms",
-        "description": "Search terms with basic filters.",
-        "inputSchema": {
-            "type":"object",
-            "properties":{
-                "customer_id":{"type":"string"},
-                "date_preset":{"type":"string"},
-                "time_range":{"type":"object","properties":{"since":{"type":"string"},"until":{"type":"string"}}},
-                "min_clicks":{"type":"integer","default":0},
-                "min_cost_micros":{"type":"integer","default":0},
-                "campaign_ids":{"type":"array","items":{"type":"string"}},
-                "ad_group_ids":{"type":"array","items":{"type":"string"}},
-                "login_customer_id":{"type":"string"}
-            },
-            "required":["customer_id"]
-        }
-    },
-    {
-        "name": "fetch_change_history",
-        "description": "Change events within a date range.",
-        "inputSchema": {
-            "type":"object",
-            "properties":{
-                "customer_id":{"type":"string"},
-                "time_range":{"type":"object","properties":{"since":{"type":"string"},"until":{"type":"string"}}},
-                "resource_types":{"type":"array","items":{"type":"string"}},
-                "login_customer_id":{"type":"string"}
-            },
-            "required":["customer_id","time_range"]
-        }
-    },
-    {
-        "name": "fetch_budget_pacing",
-        "description": "Month-to-date spend and projected end-of-month vs target.",
-        "inputSchema": {
-            "type":"object",
-            "properties":{
-                "customer_id":{"type":"string"},
-                "month":{"type":"string","description":"YYYY-MM"},
-                "target_spend":{"type":"number","description":"Target for the month in account currency"},
-                "login_customer_id":{"type":"string"}
-            },
-            "required":["customer_id","month","target_spend"]
-        }
-    }
-]
-
-# ---------- Helpers ----------
+# ---------- Helpers (segments, entities) ----------
 SEGMENT_MAP = {
     "date": "segments.date",
     "device": "segments.device",
@@ -213,13 +103,108 @@ ENTITY_FROM = {
     "ad": "ad_group_ad",
 }
 
-def _authz_check(request: Request) -> Optional[JSONResponse]:
-    if MCP_SHARED_KEY:
-        key = request.headers.get("X-MCP-Key") or ""
-        if key != MCP_SHARED_KEY:
-            return JSONResponse({"jsonrpc":"2.0","id":None,"error":{"code":-32001,"message":"Unauthorized"}}, status_code=200)
+# ---------- Client name → customer_id resolution ----------
+GADS_CLIENT_MAP_RAW = os.getenv("GADS_CLIENT_MAP", "").strip()
+try:
+    _STATIC_CLIENT_MAP = json.loads(GADS_CLIENT_MAP_RAW) if GADS_CLIENT_MAP_RAW else {}
+except Exception:
+    _STATIC_CLIENT_MAP = {}
+    log.warning("Invalid GADS_CLIENT_MAP JSON; ignoring.")
+
+def _norm_key(s: str) -> str:
+    s = s or ""
+    s = s.casefold()
+    s = re.sub(r"[^a-z0-9]+", "", s)
+    return s
+
+def _build_static_lookup() -> Dict[str, str]:
+    out = {}
+    for k, v in _STATIC_CLIENT_MAP.items():
+        if not v:
+            continue
+        out[_norm_key(k)] = str(v).replace("-", "")
+    return out
+
+_STATIC_LOOKUP = _build_static_lookup()
+_ACCOUNT_CACHE: Dict[str, Dict[str, str]] = {}
+
+def _refresh_account_cache(root_mcc: Optional[str]) -> None:
+    if not root_mcc:
+        return
+    try:
+        client = _new_ads_client(login_cid=root_mcc.replace("-", ""))
+        svc = client.get_service("GoogleAdsService")
+        q = """
+        SELECT
+          customer_client.client_customer,
+          customer_client.level,
+          customer_client.descriptive_name
+        FROM customer_client
+        WHERE customer_client.level <= 10
+        """
+        rows = _ads_call(lambda: svc.search(customer_id=root_mcc.replace("-",""), query=q, page_size=1000))
+        local = {}
+        for r in rows:
+            name = r.customer_client.descriptive_name or ""
+            cid  = str(r.customer_client.client_customer or r.customer_client.id or "")
+            if cid:
+                local[_norm_key(name)] = {"id": cid.replace("-", ""), "raw": name}
+        _ACCOUNT_CACHE.clear()
+        _ACCOUNT_CACHE.update(local)
+        log.info("Account cache refreshed: %d names", len(_ACCOUNT_CACHE))
+    except Exception as e:
+        log.warning("Failed to refresh account cache: %s", e)
+
+def _resolve_customer_id(name_or_id: str, root_mcc: Optional[str] = None) -> Optional[str]:
+    if not name_or_id:
+        return None
+    s = str(name_or_id).strip()
+    digits = re.sub(r"[^0-9]", "", s)
+    # Looks like an ID already
+    if re.fullmatch(r"\d{8,20}", digits):
+        return digits
+
+    key = _norm_key(s)
+
+    # 1) Static map first
+    if key in _STATIC_LOOKUP:
+        return _STATIC_LOOKUP[key]
+
+    # 2) Cache from MCC
+    if not _ACCOUNT_CACHE and (root_mcc or LOGIN_CUSTOMER_ID):
+        _refresh_account_cache(root_mcc or LOGIN_CUSTOMER_ID)
+
+    if key in _ACCOUNT_CACHE:
+        return _ACCOUNT_CACHE[key]["id"]
+
+    # 3) Fuzzy match
+    candidates = list(_STATIC_LOOKUP.keys() | _ACCOUNT_CACHE.keys())
+    matches = get_close_matches(key, candidates, n=1, cutoff=0.8)
+    if matches:
+        m = matches[0]
+        return _STATIC_LOOKUP.get(m) or (_ACCOUNT_CACHE.get(m) or {}).get("id")
+
     return None
 
+def _ensure_customer_id_arg(args: Dict[str, Any], *, root_mcc: Optional[str] = None) -> str:
+    """
+    Resolve args['customer_id'] from args['customer'] or args['customer_name'] if needed.
+    Mutates args to set 'customer_id'. Raises ValueError if cannot resolve.
+    """
+    cid = args.get("customer_id")
+    cname = args.get("customer") or args.get("customer_name")
+    if cid:
+        args["customer_id"] = str(cid).replace("-", "")
+        return args["customer_id"]
+    if cname:
+        resolved = _resolve_customer_id(str(cname), root_mcc)
+        if not resolved:
+            raise ValueError(f"Could not resolve client '{cname}' to a Google Ads customer ID")
+        args["customer_id"] = resolved
+        return resolved
+    raise ValueError("Missing required param: customer_id (or provide 'customer'/'customer_name')")
+
+# ---------- Time / retries / money ----------
 def _normalize_time(params: Dict[str, Any]) -> Dict[str, str]:
     pr = (params.get("date_preset") or "").strip().upper()
     tr = params.get("time_range") or {}
@@ -256,8 +241,6 @@ def _ads_call(fn, attempts=5):
 
 def _gaql_where_for_time(tnorm: Dict[str,str]) -> str:
     if "preset" in tnorm:
-        # Google Ads has date presets in the API, but GAQL generally expects explicit dates.
-        # We'll translate common presets to [start, end] UTC calendar dates.
         today = datetime.date.today()
         if tnorm["preset"] == "TODAY":
             start = end = today
@@ -282,6 +265,137 @@ def _gaql_where_for_time(tnorm: Dict[str,str]) -> str:
 
 def _money(micros: Optional[int]) -> float:
     return round((micros or 0)/1_000_000, 6)
+
+# ---------- TOOLS (schemas updated to accept customer/customer_name) ----------
+TOOLS = [
+    {
+        "name": "fetch_account_tree",
+        "description": "List accessible customer hierarchy (manager → clients).",
+        "inputSchema": {
+            "type":"object",
+            "properties":{
+                "root_customer_id":{"type":"string","description":"Manager (MCC) customer id, digits only"},
+                "depth":{"type":"integer","minimum":1,"maximum":10,"default":2}
+            },
+            "required":["root_customer_id"]
+        }
+    },
+    {
+        "name": "fetch_metrics",
+        "description": "Generic metrics for account/campaign/ad_group/ad with optional segments.",
+        "inputSchema": {
+            "type":"object",
+            "properties":{
+                "customer_id":{"type":"string","description":"Digits only; or provide 'customer'/'customer_name'"},
+                "customer":{"type":"string","description":"Client name or alias"},
+                "customer_name":{"type":"string","description":"Client name (alternative)"},
+                "entity":{"type":"string","enum":["account","campaign","ad_group","ad"],"default":"campaign"},
+                "ids":{"type":"array","items":{"type":"string"}},
+                "fields":{"type":"array","items":{"type":"string"},
+                    "default":["metrics.cost_micros","metrics.clicks","metrics.impressions","metrics.conversions","metrics.conversions_value"]},
+                "segments":{"type":"array","items":{"type":"string"},
+                    "description":"e.g. date, device, network"},
+                "date_preset":{"type":"string","description":"TODAY|YESTERDAY|LAST_7_DAYS|LAST_30_DAYS|THIS_MONTH|LAST_MONTH"},
+                "time_range":{"type":"object","properties":{"since":{"type":"string"},"until":{"type":"string"}}},
+                "page_size":{"type":"integer","minimum":1,"maximum":10000,"default":1000},
+                "page_token":{"type":["string","null"]},
+                "login_customer_id":{"type":"string","description":"Manager id for header (optional)"}
+            }
+        }
+    },
+    {
+        "name": "fetch_campaign_summary",
+        "description": "Per-campaign KPIs with computed ctr/cpc/cpa/roas.",
+        "inputSchema": {
+            "type":"object",
+            "properties":{
+                "customer_id":{"type":"string"},
+                "customer":{"type":"string"},
+                "customer_name":{"type":"string"},
+                "date_preset":{"type":"string"},
+                "time_range":{"type":"object","properties":{"since":{"type":"string"},"until":{"type":"string"}}},
+                "login_customer_id":{"type":"string"}
+            }
+        }
+    },
+    {
+        "name": "list_recommendations",
+        "description": "Google Ads Recommendations for a customer.",
+        "inputSchema": {
+            "type":"object",
+            "properties":{
+                "customer_id":{"type":"string"},
+                "customer":{"type":"string"},
+                "customer_name":{"type":"string"},
+                "types":{"type":"array","items":{"type":"string"}},
+                "login_customer_id":{"type":"string"}
+            }
+        }
+    },
+    {
+        "name": "fetch_search_terms",
+        "description": "Search terms with basic filters.",
+        "inputSchema": {
+            "type":"object",
+            "properties":{
+                "customer_id":{"type":"string"},
+                "customer":{"type":"string"},
+                "customer_name":{"type":"string"},
+                "date_preset":{"type":"string"},
+                "time_range":{"type":"object","properties":{"since":{"type":"string"},"until":{"type":"string"}}},
+                "min_clicks":{"type":"integer","default":0},
+                "min_cost_micros":{"type":"integer","default":0},
+                "campaign_ids":{"type":"array","items":{"type":"string"}},
+                "ad_group_ids":{"type":"array","items":{"type":"string"}},
+                "login_customer_id":{"type":"string"}
+            }
+        }
+    },
+    {
+        "name": "fetch_change_history",
+        "description": "Change events within a date range.",
+        "inputSchema": {
+            "type":"object",
+            "properties":{
+                "customer_id":{"type":"string"},
+                "customer":{"type":"string"},
+                "customer_name":{"type":"string"},
+                "time_range":{"type":"object","properties":{"since":{"type":"string"},"until":{"type":"string"}}},
+                "resource_types":{"type":"array","items":{"type":"string"}},
+                "login_customer_id":{"type":"string"}
+            },
+            "required":["time_range"]
+        }
+    },
+    {
+        "name": "fetch_budget_pacing",
+        "description": "Month-to-date spend and projected end-of-month vs target.",
+        "inputSchema": {
+            "type":"object",
+            "properties":{
+                "customer_id":{"type":"string"},
+                "customer":{"type":"string"},
+                "customer_name":{"type":"string"},
+                "month":{"type":"string","description":"YYYY-MM"},
+                "target_spend":{"type":"number","description":"Target for the month in account currency"},
+                "login_customer_id":{"type":"string"}
+            },
+            "required":["month","target_spend"]
+        }
+    },
+    {
+        "name": "resolve_customer",
+        "description": "Resolve a client name or alias (or raw ID) to a normalized customer_id.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "customer": {"type":"string","description":"Client name, alias, or numeric ID"},
+                "login_customer_id": {"type":"string","description":"MCC for hierarchy lookup (optional)"}
+            },
+            "required": ["customer"]
+        }
+    }
+]
 
 # ---------- Tool implementations ----------
 def tool_fetch_account_tree(args: Dict[str, Any]) -> Dict[str, Any]:
@@ -315,7 +429,8 @@ def tool_fetch_account_tree(args: Dict[str, Any]) -> Dict[str, Any]:
     return {"root": root, "clients": out}
 
 def tool_fetch_metrics(args: Dict[str, Any]) -> Dict[str, Any]:
-    customer_id = args["customer_id"].replace("-", "")
+    login = (args.get("login_customer_id") or LOGIN_CUSTOMER_ID or "").replace("-", "") or None
+    customer_id = _ensure_customer_id_arg(args, root_mcc=login).replace("-", "")
     entity = args.get("entity","campaign")
     if entity not in ENTITY_FROM: raise ValueError("Invalid entity")
     fields = args.get("fields") or ["metrics.cost_micros","metrics.clicks","metrics.impressions","metrics.conversions","metrics.conversions_value"]
@@ -324,7 +439,6 @@ def tool_fetch_metrics(args: Dict[str, Any]) -> Dict[str, Any]:
     segs = [SEGMENT_MAP.get(s,s) for s in segs_in]
     tnorm = _normalize_time(args)
     where_time = _gaql_where_for_time(tnorm)
-    login = (args.get("login_customer_id") or LOGIN_CUSTOMER_ID or "").replace("-","") or None
 
     select_cols = []
     if entity == "account":
@@ -336,21 +450,15 @@ def tool_fetch_metrics(args: Dict[str, Any]) -> Dict[str, Any]:
     else:
         select_cols += ["ad_group_ad.ad.id","ad_group_ad.ad.name","ad_group.id","ad_group.name","campaign.id","campaign.name"]
 
-    select_cols += fields
-    select_cols += segs
+    select_cols += fields + segs
 
     frm = ENTITY_FROM[entity]
     where_ids = ""
     if ids:
         col = {"account":"customer.id","campaign":"campaign.id","ad_group":"ad_group.id","ad":"ad_group_ad.ad.id"}[entity]
-        ids_csv = ",".join(ids)
-        where_ids = f" AND {col} IN ({ids_csv}) "
+        where_ids = f" AND {col} IN ({','.join(ids)}) "
 
-    q = f"""
-    SELECT {", ".join(select_cols)}
-    FROM {frm}
-    WHERE {where_time} {where_ids}
-    """
+    q = f"""SELECT {", ".join(select_cols)} FROM {frm} WHERE {where_time} {where_ids}"""
     client = _new_ads_client(login_cid=login)
     svc = client.get_service("GoogleAdsService")
     page_size = int(args.get("page_size", 1000))
@@ -360,8 +468,6 @@ def tool_fetch_metrics(args: Dict[str, Any]) -> Dict[str, Any]:
     out_rows = []
     next_token = getattr(resp, "next_page_token", None)
     for r in resp:
-        row = r._pb  # protobuf; we’ll pull the known fields safely below
-        # Extract metrics & ids defensively
         obj = {}
         try:
             if entity == "account":
@@ -392,7 +498,6 @@ def tool_fetch_metrics(args: Dict[str, Any]) -> Dict[str, Any]:
                 "conversions": getattr(m, "conversions", 0.0),
                 "conversions_value": getattr(m, "conversions_value", 0.0),
             })
-            # segments requested
             if segs:
                 if "segments.date" in segs:
                     obj["date"] = str(r.segments.date)
@@ -407,8 +512,8 @@ def tool_fetch_metrics(args: Dict[str, Any]) -> Dict[str, Any]:
     return {"query": q, "count": len(out_rows), "next_page_token": next_token or "", "rows": out_rows}
 
 def tool_fetch_campaign_summary(args: Dict[str, Any]) -> Dict[str, Any]:
-    customer_id = args["customer_id"].replace("-", "")
-    login = (args.get("login_customer_id") or LOGIN_CUSTOMER_ID or "").replace("-","") or None
+    login = (args.get("login_customer_id") or LOGIN_CUSTOMER_ID or "").replace("-", "") or None
+    customer_id = _ensure_customer_id_arg(args, root_mcc=login).replace("-", "")
     tnorm = _normalize_time(args)
     where_time = _gaql_where_for_time(tnorm)
     q = f"""
@@ -449,8 +554,8 @@ def tool_fetch_campaign_summary(args: Dict[str, Any]) -> Dict[str, Any]:
     return {"summary": out, "query": q}
 
 def tool_list_recommendations(args: Dict[str, Any]) -> Dict[str, Any]:
-    customer_id = args["customer_id"].replace("-", "")
-    login = (args.get("login_customer_id") or LOGIN_CUSTOMER_ID or "").replace("-","") or None
+    login = (args.get("login_customer_id") or LOGIN_CUSTOMER_ID or "").replace("-", "") or None
+    customer_id = _ensure_customer_id_arg(args, root_mcc=login).replace("-", "")
     types = args.get("types") or []
     type_filter = ""
     if types:
@@ -481,8 +586,8 @@ def tool_list_recommendations(args: Dict[str, Any]) -> Dict[str, Any]:
     return {"recommendations": out, "query": q}
 
 def tool_fetch_search_terms(args: Dict[str, Any]) -> Dict[str, Any]:
-    customer_id = args["customer_id"].replace("-", "")
-    login = (args.get("login_customer_id") or LOGIN_CUSTOMER_ID or "").replace("-","") or None
+    login = (args.get("login_customer_id") or LOGIN_CUSTOMER_ID or "").replace("-", "") or None
+    customer_id = _ensure_customer_id_arg(args, root_mcc=login).replace("-", "")
     tnorm = _normalize_time(args)
     where_time = _gaql_where_for_time(tnorm)
     min_clicks = int(args.get("min_clicks", 0))
@@ -525,8 +630,8 @@ def tool_fetch_search_terms(args: Dict[str, Any]) -> Dict[str, Any]:
     return {"rows": out, "query": q}
 
 def tool_fetch_change_history(args: Dict[str, Any]) -> Dict[str, Any]:
-    customer_id = args["customer_id"].replace("-", "")
-    login = (args.get("login_customer_id") or LOGIN_CUSTOMER_ID or "").replace("-","") or None
+    login = (args.get("login_customer_id") or LOGIN_CUSTOMER_ID or "").replace("-", "") or None
+    customer_id = _ensure_customer_id_arg(args, root_mcc=login).replace("-", "")
     tr = args["time_range"]; since = tr["since"]; until = tr["until"]
     types = args.get("resource_types") or []
     type_filter = ""
@@ -561,18 +666,16 @@ def tool_fetch_change_history(args: Dict[str, Any]) -> Dict[str, Any]:
     return {"changes": out, "query": q}
 
 def tool_fetch_budget_pacing(args: Dict[str, Any]) -> Dict[str, Any]:
-    customer_id = args["customer_id"].replace("-", "")
-    login = (args.get("login_customer_id") or LOGIN_CUSTOMER_ID or "").replace("-","") or None
+    login = (args.get("login_customer_id") or LOGIN_CUSTOMER_ID or "").replace("-", "") or None
+    customer_id = _ensure_customer_id_arg(args, root_mcc=login).replace("-", "")
     month = args["month"]  # YYYY-MM
     target = float(args["target_spend"])
     year, mon = map(int, month.split("-"))
     start = datetime.date(year, mon, 1)
-    # end date = today if same month; else last day of month
     today = datetime.date.today()
     if today.year == year and today.month == mon:
         end = today
         days_elapsed = (end - start).days + 1
-        # days in month
         next_month = (start.replace(day=28) + datetime.timedelta(days=4)).replace(day=1)
         days_in_month = (next_month - start).days
     else:
@@ -594,7 +697,6 @@ def tool_fetch_budget_pacing(args: Dict[str, Any]) -> Dict[str, Any]:
     mtd_cost = 0
     for r in rows:
         mtd_cost += _money(r.metrics.cost_micros)
-    # naive linear projection
     avg_per_day = (mtd_cost / days_elapsed) if days_elapsed else 0.0
     projected_eom = round(avg_per_day * days_in_month, 2)
     pace_status = "on_track"
@@ -610,6 +712,12 @@ def tool_fetch_budget_pacing(args: Dict[str, Any]) -> Dict[str, Any]:
         "query": q
     }
 
+def tool_resolve_customer(args: Dict[str, Any]) -> Dict[str, Any]:
+    login = (args.get("login_customer_id") or LOGIN_CUSTOMER_ID or "").replace("-", "") or None
+    target = args["customer"]
+    resolved = _resolve_customer_id(target, login)
+    return {"input": target, "resolved_customer_id": resolved}
+
 # ---------- Health & discovery ----------
 @app.get("/", include_in_schema=False)
 @app.head("/", include_in_schema=False)
@@ -617,6 +725,14 @@ async def root_get(request: Request):
     if request.method == "HEAD":
         return PlainTextResponse("")
     return PlainTextResponse("ok")
+
+# Quiet favicon noise in logs (optional but nice)
+@app.get("/favicon.ico", include_in_schema=False)
+def favicon_ico(): return Response(status_code=204)
+@app.get("/favicon.png", include_in_schema=False)
+def favicon_png(): return Response(status_code=204)
+@app.get("/favicon.svg", include_in_schema=False)
+def favicon_svg(): return Response(status_code=204)
 
 @app.get("/.well-known/mcp.json")
 def mcp_discovery():
@@ -718,6 +834,9 @@ async def rpc(request: Request):
                 elif name == "fetch_budget_pacing":
                     data = tool_fetch_budget_pacing(args)
                     res  = mcp_ok_json("Budget pacing", data)
+                elif name == "resolve_customer":
+                    data = tool_resolve_customer(args)
+                    res  = mcp_ok_json("Resolved customer", data)
                 else:
                     return JSONResponse(
                         {"jsonrpc": "2.0", "id": _id,
