@@ -46,6 +46,7 @@ def _new_ads_client(login_cid: Optional[str] = None) -> GoogleAdsClient:
         "client_id": CLIENT_ID,
         "client_secret": CLIENT_SECRET,
         "refresh_token": REFRESH_TOKEN,
+        "use_proto_plus": True,
     }
     if login_cid or LOGIN_CUSTOMER_ID:
         cfg["login_customer_id"] = (login_cid or LOGIN_CUSTOMER_ID).replace("-", "")
