@@ -52,6 +52,15 @@ def _new_ads_client(login_cid: Optional[str] = None) -> GoogleAdsClient:
         cfg["login_customer_id"] = (login_cid or LOGIN_CUSTOMER_ID).replace("-", "")
     return GoogleAdsClient.load_from_dict(cfg)
 
+def _ga_search(svc, customer_id: str, query: str, page_size: Optional[int] = None, page_token: Optional[str] = None):
+    req = {"customer_id": customer_id, "query": query}
+    if page_size:
+        req["page_size"] = int(page_size)
+    if page_token:
+        req["page_token"] = page_token
+    # Use your retry wrapper
+    return _ads_call(lambda: svc.search(request=req))
+
 # ---------- FastAPI base ----------
 app = FastAPI()
 
@@ -303,34 +312,36 @@ TOOLS = [
         "name": "fetch_account_tree",
         "description": "List accessible customer hierarchy (manager → clients).",
         "inputSchema": {
-            "type":"object",
-            "properties":{
-                "root_customer_id":{"type":"string","description":"Manager (MCC) customer id, digits only"},
-                "depth":{"type":"integer","minimum":1,"maximum":10,"default":2}
+            "type": "object",
+            "properties": {
+                "root_customer_id": {"type": "string", "description": "Manager (MCC) customer id, digits only"},
+                "depth": {"type": "integer", "minimum": 1, "maximum": 10, "default": 2}
             },
-            "required":["root_customer_id"]
+            "required": ["root_customer_id"]
         }
     },
     {
         "name": "fetch_metrics",
         "description": "Generic metrics for account/campaign/ad_group/ad with optional segments.",
         "inputSchema": {
-            "type":"object",
-            "properties":{
-                "customer_id":{"type":"string","description":"Digits only; or provide 'customer'/'customer_name'"},
-                "customer":{"type":"string","description":"Client name or alias"},
-                "customer_name":{"type":"string","description":"Client name (alternative)"},
-                "entity":{"type":"string","enum":["account","campaign","ad_group","ad"],"default":"campaign"},
-                "ids":{"type":"array","items":{"type":"string"}},
-                "fields":{"type":"array","items":{"type":"string"},
-                    "default":["metrics.cost_micros","metrics.clicks","metrics.impressions","metrics.conversions","metrics.conversions_value"]},
-                "segments":{"type":"array","items":{"type":"string"},
-                    "description":"e.g. date, device, network"},
-                "date_preset":{"type":"string","description":"TODAY|YESTERDAY|LAST_7_DAYS|LAST_30_DAYS|THIS_MONTH|LAST_MONTH"},
-                "time_range":{"type":"object","properties":{"since":{"type":"string"},"until":{"type":"string"}}},
-                "page_size":{"type":"integer","minimum":1,"maximum":10000,"default":1000},
-                "page_token":{"type":["string","null"]},
-                "login_customer_id":{"type":"string","description":"Manager id for header (optional)"}
+            "type": "object",
+            "properties": {
+                "customer_id":   {"type": "string", "description": "Digits only; or provide 'customer'/'customer_name'"},
+                "customer":      {"type": "string", "description": "Client name or alias"},
+                "customer_name": {"type": "string", "description": "Client name (alternative)"},
+                "entity": {"type": "string", "enum": ["account","campaign","ad_group","ad"], "default": "campaign"},
+                "ids":    {"type": "array", "items": {"type": "string"}, "description": "Filter to specific IDs for the chosen entity"},
+                "fields": {"type": "array", "items": {"type": "string"},
+                    "default": ["metrics.cost_micros","metrics.clicks","metrics.impressions","metrics.conversions","metrics.conversions_value"]},
+                "segments": {"type": "array", "items": {"type": "string"},
+                    "description": "Optional segments: date, device, network, hour, day_of_week, quarter"},
+                "date_preset": {"type": "string",
+                    "description": "TODAY|YESTERDAY|LAST_7_DAYS|LAST_30_DAYS|THIS_MONTH|LAST_MONTH"},
+                "time_range": {"type": "object", "properties": {"since": {"type": "string"}, "until": {"type": "string"}},
+                    "description": "Explicit YYYY-MM-DD range (overrides date_preset)"},
+                "page_size":  {"type": "integer", "minimum": 1, "maximum": 10000, "default": 1000},
+                "page_token": {"type": ["string","null"]},
+                "login_customer_id": {"type": "string", "description": "Manager id for header (optional)"}
             }
         }
     },
@@ -338,14 +349,15 @@ TOOLS = [
         "name": "fetch_campaign_summary",
         "description": "Per-campaign KPIs with computed ctr/cpc/cpa/roas.",
         "inputSchema": {
-            "type":"object",
-            "properties":{
-                "customer_id":{"type":"string"},
-                "customer":{"type":"string"},
-                "customer_name":{"type":"string"},
-                "date_preset":{"type":"string"},
-                "time_range":{"type":"object","properties":{"since":{"type":"string"},"until":{"type":"string"}}},
-                "login_customer_id":{"type":"string"}
+            "type": "object",
+            "properties": {
+                "customer_id":   {"type": "string"},
+                "customer":      {"type": "string"},
+                "customer_name": {"type": "string"},
+                "date_preset":   {"type": "string",
+                    "description": "TODAY|YESTERDAY|LAST_7_DAYS|LAST_30_DAYS|THIS_MONTH|LAST_MONTH"},
+                "time_range": {"type": "object", "properties": {"since": {"type": "string"}, "until": {"type": "string"}}},
+                "login_customer_id": {"type": "string"}
             }
         }
     },
@@ -353,13 +365,13 @@ TOOLS = [
         "name": "list_recommendations",
         "description": "Google Ads Recommendations for a customer.",
         "inputSchema": {
-            "type":"object",
-            "properties":{
-                "customer_id":{"type":"string"},
-                "customer":{"type":"string"},
-                "customer_name":{"type":"string"},
-                "types":{"type":"array","items":{"type":"string"}},
-                "login_customer_id":{"type":"string"}
+            "type": "object",
+            "properties": {
+                "customer_id":   {"type": "string"},
+                "customer":      {"type": "string"},
+                "customer_name": {"type": "string"},
+                "types": {"type": "array", "items": {"type": "string"}, "description": "Optional filter by recommendation.type"},
+                "login_customer_id": {"type": "string"}
             }
         }
     },
@@ -367,18 +379,19 @@ TOOLS = [
         "name": "fetch_search_terms",
         "description": "Search terms with basic filters.",
         "inputSchema": {
-            "type":"object",
-            "properties":{
-                "customer_id":{"type":"string"},
-                "customer":{"type":"string"},
-                "customer_name":{"type":"string"},
-                "date_preset":{"type":"string"},
-                "time_range":{"type":"object","properties":{"since":{"type":"string"},"until":{"type":"string"}}},
-                "min_clicks":{"type":"integer","default":0},
-                "min_cost_micros":{"type":"integer","default":0},
-                "campaign_ids":{"type":"array","items":{"type":"string"}},
-                "ad_group_ids":{"type":"array","items":{"type":"string"}},
-                "login_customer_id":{"type":"string"}
+            "type": "object",
+            "properties": {
+                "customer_id":   {"type": "string"},
+                "customer":      {"type": "string"},
+                "customer_name": {"type": "string"},
+                "date_preset":   {"type": "string",
+                    "description": "TODAY|YESTERDAY|LAST_7_DAYS|LAST_30_DAYS|THIS_MONTH|LAST_MONTH"},
+                "time_range": {"type": "object", "properties": {"since": {"type": "string"}, "until": {"type": "string"}}},
+                "min_clicks": {"type": "integer", "default": 0},
+                "min_cost_micros": {"type": "integer", "default": 0},
+                "campaign_ids": {"type": "array", "items": {"type": "string"}},
+                "ad_group_ids": {"type": "array", "items": {"type": "string"}},
+                "login_customer_id": {"type": "string"}
             }
         }
     },
@@ -386,32 +399,32 @@ TOOLS = [
         "name": "fetch_change_history",
         "description": "Change events within a date range.",
         "inputSchema": {
-            "type":"object",
-            "properties":{
-                "customer_id":{"type":"string"},
-                "customer":{"type":"string"},
-                "customer_name":{"type":"string"},
-                "time_range":{"type":"object","properties":{"since":{"type":"string"},"until":{"type":"string"}}},
-                "resource_types":{"type":"array","items":{"type":"string"}},
-                "login_customer_id":{"type":"string"}
+            "type": "object",
+            "properties": {
+                "customer_id":   {"type": "string"},
+                "customer":      {"type": "string"},
+                "customer_name": {"type": "string"},
+                "time_range": {"type": "object", "properties": {"since": {"type": "string"}, "until": {"type": "string"}}},
+                "resource_types": {"type": "array", "items": {"type": "string"}, "description": "Optional: filter by change_event.resource_type"},
+                "login_customer_id": {"type": "string"}
             },
-            "required":["time_range"]
+            "required": ["time_range"]
         }
     },
     {
         "name": "fetch_budget_pacing",
         "description": "Month-to-date spend and projected end-of-month vs target.",
         "inputSchema": {
-            "type":"object",
-            "properties":{
-                "customer_id":{"type":"string"},
-                "customer":{"type":"string"},
-                "customer_name":{"type":"string"},
-                "month":{"type":"string","description":"YYYY-MM"},
-                "target_spend":{"type":"number","description":"Target for the month in account currency"},
-                "login_customer_id":{"type":"string"}
+            "type": "object",
+            "properties": {
+                "customer_id":   {"type": "string"},
+                "customer":      {"type": "string"},
+                "customer_name": {"type": "string"},
+                "month": {"type": "string", "description": "YYYY-MM"},
+                "target_spend": {"type": "number", "description": "Target for the month in account currency"},
+                "login_customer_id": {"type": "string"}
             },
-            "required":["month","target_spend"]
+            "required": ["month","target_spend"]
         }
     },
     {
@@ -420,18 +433,21 @@ TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "customer": {"type":"string","description":"Client name, alias, or numeric ID"},
-                "login_customer_id": {"type":"string","description":"MCC for hierarchy lookup (optional)"}
+                "customer": {"type":"string", "description":"Client name, alias, or numeric ID"},
+                "login_customer_id": {"type":"string", "description":"MCC for hierarchy lookup (optional)"}
             },
             "required": ["customer"]
         }
     }
 ]
+
+# Public health check (no auth required)
 TOOLS.append({
     "name": "ping",
     "description": "Health check (public).",
-    "inputSchema": {"type":"object","properties":{}}
+    "inputSchema": {"type": "object", "properties": {}}
 })
+
 
 # ---------- Tool implementations ----------
 def tool_ping(args: Dict[str, Any]) -> Dict[str, Any]:
