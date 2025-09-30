@@ -27,7 +27,7 @@ DEV_TOKEN         = os.getenv("GOOGLE_ADS_DEVELOPER_TOKEN", "")
 CLIENT_ID         = os.getenv("GOOGLE_ADS_CLIENT_ID", "")
 CLIENT_SECRET     = os.getenv("GOOGLE_ADS_CLIENT_SECRET", "")
 REFRESH_TOKEN     = os.getenv("GOOGLE_ADS_REFRESH_TOKEN", "")
-LOGIN_CUSTOMER_ID = os.getenv("GOOGLE_ADS_LOGIN_CUSTOMER_ID", "")  # manager id, no dashes
+LOGIN_CUSTOMER_ID = os.getenv("GOOGLE_ADS_LOGIN_CUSTOMER_ID", "").strip()  # <-- strip it
 
 def _require_env():
     missing = [k for k,v in [
