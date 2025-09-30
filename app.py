@@ -50,7 +50,7 @@ def _new_ads_client(login_cid: Optional[str] = None) -> GoogleAdsClient:
     }
     if login_cid or LOGIN_CUSTOMER_ID:
         cfg["login_customer_id"] = (login_cid or LOGIN_CUSTOMER_ID).replace("-", "")
-    return GoogleAdsClient.load_from_dict(cfg, version="v18")  # adjust if you pin versions
+    return GoogleAdsClient.load_from_dict(cfg)
 
 # ---------- FastAPI base ----------
 app = FastAPI()
