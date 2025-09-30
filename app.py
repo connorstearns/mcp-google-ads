@@ -983,6 +983,9 @@ async def rpc(request: Request):
                 elif name == "ping":
                     data = tool_ping(args)
                     res  = mcp_ok_json("pong", data)
+                elif name == "debug_login_header":
+                    data = tool_debug_login_header(args)
+                    res  = mcp_ok_json("Debug login header", data)
                 else:
                     return JSONResponse(
                         {"jsonrpc": "2.0", "id": _id,
