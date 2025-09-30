@@ -182,7 +182,9 @@ def _refresh_account_cache(root_mcc: Optional[str]) -> None:
         FROM customer_client
         WHERE customer_client.level <= 10
         """
-        rows = _ads_call(lambda: svc.search(customer_id=root_mcc.replace("-",""), query=q, page_size=1000))
+        rows = _ads_call(lambda: svc.search(request={
+            "customer_id": str(root_mcc).replace("-",""),
+            "query": q, "page_size": 1000}))
         local = {}
         for r in rows:
             name = r.customer_client.descriptive_name or ""
@@ -470,7 +472,11 @@ def tool_fetch_account_tree(args: Dict[str, Any]) -> Dict[str, Any]:
     FROM customer_client
     WHERE customer_client.level <= {depth}
     """
-    rows = _ads_call(lambda: svc.search(customer_id=root, query=q, page_size=1000))
+    rows = _ads_call(lambda: svc.search(request={
+        "customer_id": str(root),
+        "query": q,
+        "page_size": 1000
+    }))
     out = []
     for r in rows:
         cc = r.customer_client
@@ -519,7 +525,12 @@ def tool_fetch_metrics(args: Dict[str, Any]) -> Dict[str, Any]:
     page_size = int(args.get("page_size", 1000))
     page_token = args.get("page_token")
 
-    resp = _ads_call(lambda: svc.search(customer_id=customer_id, query=q, page_size=page_size, page_token=page_token))
+    req = {"customer_id": str(customer_id), "query": q}
+    if page_size:
+        req["page_size"] = page_size
+    if page_token:
+        req["page_token"] = page_token
+    resp = _ads_call(lambda: svc.search(request=req))
     out_rows = []
     next_token = getattr(resp, "next_page_token", None)
     for r in resp:
@@ -580,7 +591,11 @@ def tool_fetch_campaign_summary(args: Dict[str, Any]) -> Dict[str, Any]:
     """
     client = _new_ads_client(login_cid=login)
     svc = client.get_service("GoogleAdsService")
-    rows = _ads_call(lambda: svc.search(customer_id=customer_id, query=q, page_size=5000))
+    rows = _ads_call(lambda: svc.search(request={
+        "customer_id": str(customer_id),
+        "query": q,
+        "page_size": 5000
+    }))
     out = []
     for r in rows:
         cost = _money(r.metrics.cost_micros)
@@ -628,7 +643,11 @@ def tool_list_recommendations(args: Dict[str, Any]) -> Dict[str, Any]:
     """
     client = _new_ads_client(login_cid=login)
     svc = client.get_service("GoogleAdsService")
-    rows = _ads_call(lambda: svc.search(customer_id=customer_id, query=q, page_size=1000))
+    rows = _ads_call(lambda: svc.search(request={
+        "customer_id": str(customer_id),
+        "query": q,
+        "page_size": 1000
+    }))
     out = []
     for r in rows:
         out.append({
@@ -667,7 +686,11 @@ def tool_fetch_search_terms(args: Dict[str, Any]) -> Dict[str, Any]:
     """
     client = _new_ads_client(login_cid=login)
     svc = client.get_service("GoogleAdsService")
-    rows = _ads_call(lambda: svc.search(customer_id=customer_id, query=q, page_size=5000))
+    rows = _ads_call(lambda: svc.search(request={
+        "customer_id": str(customer_id),
+        "query": q,
+        "page_size": 5000
+    }))
     out = []
     for r in rows:
         out.append({
@@ -708,7 +731,11 @@ def tool_fetch_change_history(args: Dict[str, Any]) -> Dict[str, Any]:
     """
     client = _new_ads_client(login_cid=login)
     svc = client.get_service("GoogleAdsService")
-    rows = _ads_call(lambda: svc.search(customer_id=customer_id, query=q, page_size=1000))
+    rows = _ads_call(lambda: svc.search(request={
+        "customer_id": str(customer_id),
+        "query": q,
+        "page_size": 1000
+    }))
     out = []
     for r in rows:
         out.append({
@@ -748,7 +775,11 @@ def tool_fetch_budget_pacing(args: Dict[str, Any]) -> Dict[str, Any]:
     """
     client = _new_ads_client(login_cid=login)
     svc = client.get_service("GoogleAdsService")
-    rows = _ads_call(lambda: svc.search(customer_id=customer_id, query=q, page_size=1000))
+    rows = _ads_call(lambda: svc.search(request={
+        "customer_id": str(customer_id),
+        "query": q,
+        "page_size": 1000
+    }))
     mtd_cost = 0
     for r in rows:
         mtd_cost += _money(r.metrics.cost_micros)
