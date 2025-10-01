@@ -320,6 +320,7 @@ TOOLS = [
         "description": "List accessible customer hierarchy (manager → clients).",
         "inputSchema": {
             "type": "object",
+            "additionalProperties": False,
             "properties": {
                 "root_customer_id": {"type": "string", "description": "Manager (MCC) customer id, digits only"},
                 "depth": {"type": "integer", "minimum": 1, "maximum": 10, "default": 2}
@@ -332,6 +333,7 @@ TOOLS = [
         "description": "Generic metrics for account/campaign/ad_group/ad with optional segments.",
         "inputSchema": {
             "type": "object",
+            "additionalProperties": False,
             "properties": {
                 "customer_id":   {"type": "string", "description": "Digits only; or provide 'customer'/'customer_name'"},
                 "customer":      {"type": "string", "description": "Client name or alias"},
@@ -359,6 +361,7 @@ TOOLS = [
         "description": "Per-campaign KPIs with computed ctr/cpc/cpa/roas.",
         "inputSchema": {
             "type": "object",
+            "additionalProperties": False,
             "properties": {
                 "customer_id":   {"type": "string"},
                 "customer":      {"type": "string"},
@@ -375,6 +378,7 @@ TOOLS = [
         "description": "Google Ads Recommendations for a customer.",
         "inputSchema": {
             "type": "object",
+            "additionalProperties": False,
             "properties": {
                 "customer_id":   {"type": "string"},
                 "customer":      {"type": "string"},
@@ -389,6 +393,7 @@ TOOLS = [
         "description": "Search terms with basic filters.",
         "inputSchema": {
             "type": "object",
+            "additionalProperties": False,
             "properties": {
                 "customer_id":   {"type": "string"},
                 "customer":      {"type": "string"},
@@ -409,6 +414,7 @@ TOOLS = [
         "description": "Change events within a date range.",
         "inputSchema": {
             "type": "object",
+            "additionalProperties": False,
             "properties": {
                 "customer_id":   {"type": "string"},
                 "customer":      {"type": "string"},
@@ -425,6 +431,7 @@ TOOLS = [
         "description": "Month-to-date spend and projected end-of-month vs target.",
         "inputSchema": {
             "type": "object",
+            "additionalProperties": False,
             "properties": {
                 "customer_id":   {"type": "string"},
                 "customer":      {"type": "string"},
@@ -441,6 +448,7 @@ TOOLS = [
         "description": "List accessible Google Ads customer accounts for the authenticated user.",
         "inputSchema": {
             "type": "object",
+            "additionalProperties": False,
             "properties": {
                 "login_customer_id": {
                     "type": "string",
@@ -454,6 +462,7 @@ TOOLS = [
         "description": "Resolve a client name or alias (or raw ID) to a normalized customer_id.",
         "inputSchema": {
             "type": "object",
+            "additionalProperties": False,
             "properties": {
                 "customer": {"type":"string", "description":"Client name, alias, or numeric ID"},
                 "login_customer_id": {"type":"string", "description":"MCC for hierarchy lookup (optional)"}
