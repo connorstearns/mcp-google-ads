@@ -554,6 +554,21 @@ TOOLS.append({
 def tool_debug_login_header(_args: Dict[str, Any]) -> Dict[str, Any]:
     return {"env_LOGIN_CUSTOMER_ID": LOGIN_CUSTOMER_ID}
 
+TOOLS.append({
+  "name": "echo_short",
+  "description": "Echo a short string. Use only for debugging tool calls.",
+  "inputSchema": {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {"msg": {"type": "string", "maxLength": 80}},
+    "required": ["msg"]
+}})
+
+def tool_echo_short(args: Dict[str, Any]) -> Dict[str, Any]:
+    m = (args.get("msg") or "").strip()
+    if not m: raise ValueError("msg required")
+    return {"msg": m}
+
 
 # ---------- Tool implementations ----------
 def tool_ping(args: Dict[str, Any]) -> Dict[str, Any]:
