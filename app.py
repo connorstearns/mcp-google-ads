@@ -114,10 +114,8 @@ app.add_middleware(RPCAudit)
 
 # ---------- MCP tooling ----------
 def mcp_ok_json(title: str, data: Any) -> Dict[str, Any]:
-    # Dual payload: JSON (machine) + text (human)
     return {"content": [
         {"type": "json", "json": data},
-        {"type": "text", "text": f"{title}\n" + json.dumps(data, indent=2, ensure_ascii=False)}
     ]}
 
 def mcp_err(message: str, data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
