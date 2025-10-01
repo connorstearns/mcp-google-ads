@@ -15,6 +15,12 @@ from google.ads.googleads.errors import GoogleAdsException
 APP_NAME = "mcp-google-ads"
 APP_VER  = "0.1.0"
 MCP_PROTO_DEFAULT = "2024-11-05"
+SUPPORTED_MCP_VERSIONS: List[str] = sorted({MCP_PROTO_DEFAULT})
+
+
+def _latest_supported_protocol() -> str:
+    """Return the newest protocol revision this server supports."""
+    return SUPPORTED_MCP_VERSIONS[-1]
 
 # ---------- Logging & shared-secret ----------
 logging.basicConfig(level=logging.INFO)
@@ -78,9 +84,12 @@ app.add_middleware(
 
 class MCPProtocolHeader(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        proto = request.headers.get("MCP-Protocol-Version") or MCP_PROTO_DEFAULT
+        request_default = request.headers.get("MCP-Protocol-Version") or _latest_supported_protocol()
         response = await call_next(request)
-        response.headers["MCP-Protocol-Version"] = proto
+        negotiated = getattr(request.state, "mcp_protocol_version", None)
+        final_proto = negotiated or response.headers.get("MCP-Protocol-Version") or request_default
+        if final_proto:
+            response.headers["MCP-Protocol-Version"] = final_proto
         return response
 
 app.add_middleware(MCPProtocolHeader)
