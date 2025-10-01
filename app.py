@@ -1017,7 +1017,7 @@ async def rpc(request: Request):
     headers: Dict[str, str] = {"MCP-Protocol-Version": proto_header}
     status = {"code": 200}
 
-    public_tools: Set[str] = {"ping", "list_resources"}
+    public_tools: Set[str] = {"ping"}
 
     try:
         payload = await request.json()
