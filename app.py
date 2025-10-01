@@ -536,57 +536,55 @@ TOOLS = [
     }
 ]
 
-# Public health check (no auth required)
+# ---------- Public/debug tools registration ----------
 TOOLS.append({
     "name": "ping",
     "description": "Health check (public).",
     "inputSchema": {"type": "object", "additionalProperties": False, "properties": {}}
 })
 
-def tool_ping(args: Dict[str, Any]) -> Dict[str, Any]:
-    return {"ok": True}  # keep it tiny
-
-# Debug: show which MCC header the server will use
 TOOLS.append({
     "name": "debug_login_header",
     "description": "Show which login_customer_id (MCC) the server will use.",
-    "inputSchema": {"type":"object","additionalProperties": False,"properties":{}}
+    "inputSchema": {"type": "object", "additionalProperties": False, "properties": {}}
 })
+
+TOOLS.append({
+    "name": "echo_short",
+    "description": "Echo a short string. Use only for debugging tool calls.",
+    "inputSchema": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {"msg": {"type": "string", "maxLength": 80}},
+        "required": ["msg"]
+    }
+})
+
+TOOLS.append({
+    "name": "noop_ok",
+    "description": "Returns a tiny fixed JSON object.",
+    "inputSchema": {"type": "object", "additionalProperties": False, "properties": {}}
+})
+
+# Public tools visible without auth (everything else is gated)
+PUBLIC_TOOLS: Set[str] = {"ping"}  # add "noop_ok" here too if you want it public
+# PUBLIC_TOOLS: Set[str] = {"ping", "noop_ok"}
+
+# ---------- Tool implementations ----------
+def tool_ping(_args: Dict[str, Any]) -> Dict[str, Any]:
+    return {"ok": True, "time": datetime.datetime.utcnow().isoformat() + "Z"}
 
 def tool_debug_login_header(_args: Dict[str, Any]) -> Dict[str, Any]:
     return {"env_LOGIN_CUSTOMER_ID": LOGIN_CUSTOMER_ID}
 
-TOOLS.append({
-  "name": "echo_short",
-  "description": "Echo a short string. Use only for debugging tool calls.",
-  "inputSchema": {
-    "type": "object",
-    "additionalProperties": False,
-    "properties": {"msg": {"type": "string", "maxLength": 80}},
-    "required": ["msg"]
-}})
-
 def tool_echo_short(args: Dict[str, Any]) -> Dict[str, Any]:
     m = (args.get("msg") or "").strip()
-    if not m: raise ValueError("msg required")
+    if not m:
+        raise ValueError("msg required")
     return {"msg": m}
 
-TOOLS.append({
-  "name": "noop_ok",
-  "description": "Returns a tiny fixed JSON object.",
-  "inputSchema": {"type":"object","additionalProperties":False,"properties":{}}
-})
 def tool_noop_ok(_args: Dict[str, Any]) -> Dict[str, Any]:
     return {"ok": True}
-
-# dispatcher:
-elif name == "noop_ok":
-    data = tool_noop_ok(args); res = mcp_ok_json("ok", data)
-
-
-# ---------- Tool implementations ----------
-def tool_ping(args: Dict[str, Any]) -> Dict[str, Any]:
-    return {"ok": True, "time": datetime.datetime.utcnow().isoformat() + "Z"}
 
 def tool_fetch_account_tree(args: Dict[str, Any]) -> Dict[str, Any]:
     root = args["root_customer_id"].replace("-", "")
@@ -1137,6 +1135,8 @@ def _handle_single_rpc(
                 data = tool_debug_login_header(args); res = mcp_ok_json("Debug login header", data)
             elif name == "echo_short":
                 data = tool_echo_short(args); res = mcp_ok_json("echo", data)
+            elif name == "noop_ok":
+                data = tool_noop_ok(args); res = mcp_ok_json("ok", data)
             else:
                 return error(-32601, f"Unknown tool: {name}")
             return success(res)
