@@ -123,6 +123,26 @@ def mcp_err(message: str, data: Optional[Dict[str, Any]] = None) -> Dict[str, An
         out["data"] = data
     return {"code": -32000, "message": message, "data": data or {}}
 
+def _validate_protocol_version_string(version: str) -> str:
+    """Ensure the protocol version is ISO formatted (YYYY-MM-DD)."""
+    try:
+        datetime.date.fromisoformat(version)
+    except Exception as exc:  # noqa: BLE001 - propagate as ValueError
+        raise ValueError("Invalid protocol version format") from exc
+    return version
+
+
+def _negotiate_protocol_version(requested: Optional[str]) -> Optional[str]:
+    """Pick the newest supported version that does not exceed the request."""
+    if requested is None:
+        return _latest_supported_protocol()
+
+    for version in reversed(SUPPORTED_MCP_VERSIONS):
+        if version <= requested:
+            return version
+    return None
+
+
 # ---------- Helpers (segments, entities) ----------
 SEGMENT_MAP = {
     "date": "segments.date",
@@ -1020,7 +1040,8 @@ def mcp_discovery(request: Request):
     visible_tools = [t for t in TOOLS if authed or t.get("name") in PUBLIC_TOOLS]
 
     return JSONResponse({
-        "mcpVersion": MCP_PROTO_DEFAULT,
+        "mcpVersion": _latest_supported_protocol(),
+        "supportedVersions": SUPPORTED_MCP_VERSIONS,
         "name": APP_NAME,
         "version": APP_VER,
         "auth": auth,
@@ -1088,12 +1109,39 @@ def _handle_single_rpc(
         return _build_jsonrpc_error(_id, code, message, data)
 
     if method == "initialize":
-        client_proto = (payload.get("params") or {}).get("protocolVersion") or MCP_PROTO_DEFAULT
-        headers["MCP-Protocol-Version"] = client_proto
+        params = (payload.get("params") or {})
+        raw_proto = params.get("protocolVersion")
+        if raw_proto is not None and not isinstance(raw_proto, str):
+            latest = _latest_supported_protocol()
+            headers["MCP-Protocol-Version"] = latest
+            request.state.mcp_protocol_version = latest
+            return error(-32602, "protocolVersion must be a string", {"supportedVersions": SUPPORTED_MCP_VERSIONS})
+
+        requested_proto: Optional[str]
+        if raw_proto is None:
+            requested_proto = None
+        else:
+            try:
+                requested_proto = _validate_protocol_version_string(raw_proto)
+            except ValueError:
+                latest = _latest_supported_protocol()
+                headers["MCP-Protocol-Version"] = latest
+                request.state.mcp_protocol_version = latest
+                return error(-32602, "Invalid protocolVersion format", {"supportedVersions": SUPPORTED_MCP_VERSIONS})
+
+        negotiated_proto = _negotiate_protocol_version(requested_proto)
+        if negotiated_proto is None:
+            latest = _latest_supported_protocol()
+            headers["MCP-Protocol-Version"] = latest
+            request.state.mcp_protocol_version = latest
+            return error(-32602, "Unsupported protocolVersion", {"supportedVersions": SUPPORTED_MCP_VERSIONS})
+
+        headers["MCP-Protocol-Version"] = negotiated_proto
+        request.state.mcp_protocol_version = negotiated_proto
         authed = _is_authed(request)
         visible_tools = [t for t in TOOLS if authed or t.get("name") in PUBLIC_TOOLS]
         result = {
-            "protocolVersion": client_proto,
+            "protocolVersion": negotiated_proto,
             "capabilities": {"tools": {"listChanged": True}},
             "serverInfo": {"name": APP_NAME, "version": APP_VER},
             "tools": visible_tools
