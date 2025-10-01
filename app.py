@@ -638,21 +638,31 @@ def tool_fetch_metrics(args: Dict[str, Any]) -> Dict[str, Any]:
         col = {"account":"customer.id","campaign":"campaign.id","ad_group":"ad_group.id","ad":"ad_group_ad.ad.id"}[entity]
         where_ids = f" AND {col} IN ({','.join(ids)}) "
 
+        # Build GAQL
     q = f"""SELECT {", ".join(select_cols)} FROM {frm} WHERE {where_time} {where_ids}"""
+
+    # Client + service
     client = _new_ads_client(login_cid=login)
     svc = client.get_service("GoogleAdsService")
-    page_token = args.get("page_token")
 
+    # Request (do not send page_size; server has a fixed size)
     req = {"customer_id": str(customer_id), "query": q}
+    page_token = args.get("page_token")
     if page_token:
         req["page_token"] = page_token
 
+    # Execute
     resp = _ads_call(lambda: svc.search(request=req))
 
-    out_rows = []
-    next_token = getattr(resp, "next_page_token", None)
+    # Prepare output
+    out_rows: List[Dict[str, Any]] = []
+    max_rows = int(os.getenv("MCP_MAX_ROWS", "2000"))
+    next_token = getattr(resp, "next_page_token", "") or ""
+    count = 0
+
+    # Iterate rows (cap at max_rows to keep payloads modest)
     for r in resp:
-        obj = {}
+        obj: Dict[str, Any] = {}
         try:
             if entity == "account":
                 obj["customer_id"] = str(r.customer.id)
@@ -682,6 +692,8 @@ def tool_fetch_metrics(args: Dict[str, Any]) -> Dict[str, Any]:
                 "conversions": getattr(m, "conversions", 0.0),
                 "conversions_value": getattr(m, "conversions_value", 0.0),
             })
+
+            # Optional segments
             if segs:
                 if "segments.date" in segs:
                     obj["date"] = str(r.segments.date)
@@ -689,11 +701,28 @@ def tool_fetch_metrics(args: Dict[str, Any]) -> Dict[str, Any]:
                     obj["device"] = r.segments.device.name
                 if "segments.ad_network_type" in segs:
                     obj["network"] = r.segments.ad_network_type.name
-        except Exception:
-            pass
-        out_rows.append(obj)
+                if "segments.hour" in segs and hasattr(r.segments, "hour"):
+                    obj["hour"] = getattr(r.segments, "hour", None)
+                if "segments.day_of_week" in segs and hasattr(r.segments, "day_of_week"):
+                    obj["day_of_week"] = getattr(r.segments, "day_of_week", None)
+                if "segments.quarter" in segs and hasattr(r.segments, "quarter"):
+                    obj["quarter"] = getattr(r.segments, "quarter", None)
 
-    return {"query": q, "count": len(out_rows), "next_page_token": next_token or "", "rows": out_rows}
+        except Exception:
+            # Best-effort row; skip if structure unexpected
+            pass
+
+        out_rows.append(obj)
+        count += 1
+        if count >= max_rows:
+            break
+
+    return {
+        "query": q,
+        "count": len(out_rows),
+        "next_page_token": next_token,
+        "rows": out_rows
+    }
 
 def tool_fetch_campaign_summary(args: Dict[str, Any]) -> Dict[str, Any]:
     login = (args.get("login_customer_id") or LOGIN_CUSTOMER_ID or "").replace("-", "") or None
