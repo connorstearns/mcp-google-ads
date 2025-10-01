@@ -311,7 +311,7 @@ def _gaql_where_for_time(tnorm: Dict[str,str]) -> str:
 def _money(micros: Optional[int]) -> float:
     return round((micros or 0)/1_000_000, 6)
 
-# ---------- TOOLS (schemas updated to accept customer/customer_name) ----------
+# ---------- TOOLS (schemas updated with limits & patterns) ----------
 TOOLS = [
     {
         "name": "fetch_account_tree",
@@ -320,7 +320,12 @@ TOOLS = [
             "type": "object",
             "additionalProperties": False,
             "properties": {
-                "root_customer_id": {"type": "string", "description": "Manager (MCC) customer id, digits only"},
+                "root_customer_id": {
+                    "type": "string",
+                    "description": "Manager (MCC) customer id (digits or dashes)",
+                    "maxLength": 20,
+                    "pattern": "^[0-9-]+$"
+                },
                 "depth": {"type": "integer", "minimum": 1, "maximum": 10, "default": 2}
             },
             "required": ["root_customer_id"]
@@ -328,29 +333,52 @@ TOOLS = [
     },
     {
         "name": "fetch_metrics",
-        "description": "Generic metrics for account/campaign/ad_group/ad with optional segments.",
+        "description": "Generic metrics for account/campaign/ad_group/ad with optional segments. Arguments must be minimal and relevant.",
         "inputSchema": {
             "type": "object",
             "additionalProperties": False,
             "properties": {
-                "customer_id":   {"type": "string", "description": "Digits only; or provide 'customer'/'customer_name'"},
-                "customer":      {"type": "string", "description": "Client name or alias"},
-                "customer_name": {"type": "string", "description": "Client name (alternative)"},
+                "customer_id":   {"type": "string", "description": "Digits only; or provide 'customer'/'customer_name'", "maxLength": 20, "pattern": "^[0-9-]*$"},
+                "customer":      {"type": "string", "description": "Client name or alias", "maxLength": 120},
+                "customer_name": {"type": "string", "description": "Client name (alternative)", "maxLength": 120},
                 "entity": {"type": "string", "enum": ["account","campaign","ad_group","ad"], "default": "campaign"},
-                "ids":    {"type": "array", "items": {"type": "string"}, "description": "Filter to specific IDs for the chosen entity"},
-                "fields": {"type": "array", "items": {"type": "string"},
-                    "default": ["metrics.cost_micros","metrics.clicks","metrics.impressions","metrics.conversions","metrics.conversions_value"]},
-                "segments": {"type": "array", "items": {"type": "string"},
-                    "description": "Optional segments: date, device, network, hour, day_of_week, quarter"},
-                "date_preset": {"type": "string",
-                    "description": "TODAY|YESTERDAY|LAST_7_DAYS|LAST_30_DAYS|THIS_MONTH|LAST_MONTH"},
-                "time_range": {"type": "object", "properties": {"since": {"type": "string"}, "until": {"type": "string"}},
-                    "description": "Explicit YYYY-MM-DD range (overrides date_preset)"},
-                "page_size":  {"type": "integer",
+                "ids": {
+                    "type": "array",
+                    "description": "Filter to specific IDs for the chosen entity",
+                    "maxItems": 200,
+                    "items": {"type": "string", "maxLength": 30, "pattern": "^[0-9-]*$"}
+                },
+                "fields": {
+                    "type": "array",
+                    "maxItems": 100,
+                    "items": {"type": "string", "maxLength": 64},
+                    "default": ["metrics.cost_micros","metrics.clicks","metrics.impressions","metrics.conversions","metrics.conversions_value"]
+                },
+                "segments": {
+                    "type": "array",
+                    "description": "Optional segments: date, device, network, hour, day_of_week, quarter",
+                    "maxItems": 6,
+                    "items": {"type": "string", "enum": ["date","device","network","hour","day_of_week","quarter"]}
+                },
+                "date_preset": {
+                    "type": "string",
+                    "enum": ["TODAY","YESTERDAY","LAST_7_DAYS","LAST_30_DAYS","THIS_MONTH","LAST_MONTH"]
+                },
+                "time_range": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "since": {"type": "string", "maxLength": 10, "pattern": "^\\d{4}-\\d{2}-\\d{2}$"},
+                        "until": {"type": "string", "maxLength": 10, "pattern": "^\\d{4}-\\d{2}-\\d{2}$"}
+                    }
+                },
+                "page_size":  {
+                    "type": "integer",
                     "description": "DEPRECATED/IGNORED: Google Ads search uses a fixed server page size.",
-                    "minimum": 1, "maximum": 10000, "default": 1000},
-                "page_token": {"type": ["string","null"]},
-                "login_customer_id": {"type": "string", "description": "Manager id for header (optional)"}
+                    "minimum": 1, "maximum": 10000, "default": 1000
+                },
+                "page_token": {"type": ["string","null"], "maxLength": 200},
+                "login_customer_id": {"type": "string", "description": "Manager id for header (optional)", "maxLength": 20, "pattern": "^[0-9-]*$"}
             }
         }
     },
@@ -361,13 +389,19 @@ TOOLS = [
             "type": "object",
             "additionalProperties": False,
             "properties": {
-                "customer_id":   {"type": "string"},
-                "customer":      {"type": "string"},
-                "customer_name": {"type": "string"},
-                "date_preset":   {"type": "string",
-                    "description": "TODAY|YESTERDAY|LAST_7_DAYS|LAST_30_DAYS|THIS_MONTH|LAST_MONTH"},
-                "time_range": {"type": "object", "properties": {"since": {"type": "string"}, "until": {"type": "string"}}},
-                "login_customer_id": {"type": "string"}
+                "customer_id":   {"type": "string", "maxLength": 20, "pattern": "^[0-9-]*$"},
+                "customer":      {"type": "string", "maxLength": 120},
+                "customer_name": {"type": "string", "maxLength": 120},
+                "date_preset":   {"type": "string", "enum": ["TODAY","YESTERDAY","LAST_7_DAYS","LAST_30_DAYS","THIS_MONTH","LAST_MONTH"]},
+                "time_range": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "since": {"type": "string", "maxLength": 10, "pattern": "^\\d{4}-\\d{2}-\\d{2}$"},
+                        "until": {"type": "string", "maxLength": 10, "pattern": "^\\d{4}-\\d{2}-\\d{2}$"}
+                    }
+                },
+                "login_customer_id": {"type": "string", "maxLength": 20, "pattern": "^[0-9-]*$"}
             }
         }
     },
@@ -378,11 +412,16 @@ TOOLS = [
             "type": "object",
             "additionalProperties": False,
             "properties": {
-                "customer_id":   {"type": "string"},
-                "customer":      {"type": "string"},
-                "customer_name": {"type": "string"},
-                "types": {"type": "array", "items": {"type": "string"}, "description": "Optional filter by recommendation.type"},
-                "login_customer_id": {"type": "string"}
+                "customer_id":   {"type": "string", "maxLength": 20, "pattern": "^[0-9-]*$"},
+                "customer":      {"type": "string", "maxLength": 120},
+                "customer_name": {"type": "string", "maxLength": 120},
+                "types": {
+                    "type": "array",
+                    "description": "Optional filter by recommendation.type",
+                    "maxItems": 50,
+                    "items": {"type": "string", "maxLength": 64}
+                },
+                "login_customer_id": {"type": "string", "maxLength": 20, "pattern": "^[0-9-]*$"}
             }
         }
     },
@@ -393,17 +432,31 @@ TOOLS = [
             "type": "object",
             "additionalProperties": False,
             "properties": {
-                "customer_id":   {"type": "string"},
-                "customer":      {"type": "string"},
-                "customer_name": {"type": "string"},
-                "date_preset":   {"type": "string",
-                    "description": "TODAY|YESTERDAY|LAST_7_DAYS|LAST_30_DAYS|THIS_MONTH|LAST_MONTH"},
-                "time_range": {"type": "object", "properties": {"since": {"type": "string"}, "until": {"type": "string"}}},
-                "min_clicks": {"type": "integer", "default": 0},
-                "min_cost_micros": {"type": "integer", "default": 0},
-                "campaign_ids": {"type": "array", "items": {"type": "string"}},
-                "ad_group_ids": {"type": "array", "items": {"type": "string"}},
-                "login_customer_id": {"type": "string"}
+                "customer_id":   {"type": "string", "maxLength": 20, "pattern": "^[0-9-]*$"},
+                "customer":      {"type": "string", "maxLength": 120},
+                "customer_name": {"type": "string", "maxLength": 120},
+                "date_preset":   {"type": "string", "enum": ["TODAY","YESTERDAY","LAST_7_DAYS","LAST_30_DAYS","THIS_MONTH","LAST_MONTH"]},
+                "time_range": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "since": {"type": "string", "maxLength": 10, "pattern": "^\\d{4}-\\d{2}-\\d{2}$"},
+                        "until": {"type": "string", "maxLength": 10, "pattern": "^\\d{4}-\\d{2}-\\d{2}$"}
+                    }
+                },
+                "min_clicks": {"type": "integer", "minimum": 0, "default": 0},
+                "min_cost_micros": {"type": "integer", "minimum": 0, "default": 0},
+                "campaign_ids": {
+                    "type": "array",
+                    "maxItems": 200,
+                    "items": {"type": "string", "maxLength": 30, "pattern": "^[0-9-]*$"}
+                },
+                "ad_group_ids": {
+                    "type": "array",
+                    "maxItems": 200,
+                    "items": {"type": "string", "maxLength": 30, "pattern": "^[0-9-]*$"}
+                },
+                "login_customer_id": {"type": "string", "maxLength": 20, "pattern": "^[0-9-]*$"}
             }
         }
     },
@@ -414,12 +467,24 @@ TOOLS = [
             "type": "object",
             "additionalProperties": False,
             "properties": {
-                "customer_id":   {"type": "string"},
-                "customer":      {"type": "string"},
-                "customer_name": {"type": "string"},
-                "time_range": {"type": "object", "properties": {"since": {"type": "string"}, "until": {"type": "string"}}},
-                "resource_types": {"type": "array", "items": {"type": "string"}, "description": "Optional: filter by change_event.resource_type"},
-                "login_customer_id": {"type": "string"}
+                "customer_id":   {"type": "string", "maxLength": 20, "pattern": "^[0-9-]*$"},
+                "customer":      {"type": "string", "maxLength": 120},
+                "customer_name": {"type": "string", "maxLength": 120},
+                "time_range": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "since": {"type": "string", "maxLength": 19, "pattern": "^\\d{4}-\\d{2}-\\d{2}$"},
+                        "until": {"type": "string", "maxLength": 19, "pattern": "^\\d{4}-\\d{2}-\\d{2}$"}
+                    }
+                },
+                "resource_types": {
+                    "type": "array",
+                    "description": "Optional: filter by change_event.resource_type",
+                    "maxItems": 50,
+                    "items": {"type": "string", "maxLength": 64}
+                },
+                "login_customer_id": {"type": "string", "maxLength": 20, "pattern": "^[0-9-]*$"}
             },
             "required": ["time_range"]
         }
@@ -431,12 +496,12 @@ TOOLS = [
             "type": "object",
             "additionalProperties": False,
             "properties": {
-                "customer_id":   {"type": "string"},
-                "customer":      {"type": "string"},
-                "customer_name": {"type": "string"},
-                "month": {"type": "string", "description": "YYYY-MM"},
+                "customer_id":   {"type": "string", "maxLength": 20, "pattern": "^[0-9-]*$"},
+                "customer":      {"type": "string", "maxLength": 120},
+                "customer_name": {"type": "string", "maxLength": 120},
+                "month": {"type": "string", "description": "YYYY-MM", "maxLength": 7, "pattern": "^\\d{4}-\\d{2}$"},
                 "target_spend": {"type": "number", "description": "Target for the month in account currency"},
-                "login_customer_id": {"type": "string"}
+                "login_customer_id": {"type": "string", "maxLength": 20, "pattern": "^[0-9-]*$"}
             },
             "required": ["month","target_spend"]
         }
@@ -450,7 +515,9 @@ TOOLS = [
             "properties": {
                 "login_customer_id": {
                     "type": "string",
-                    "description": "Optional manager (MCC) header override"
+                    "description": "Optional manager (MCC) header override",
+                    "maxLength": 20,
+                    "pattern": "^[0-9-]*$"
                 }
             }
         }
@@ -462,8 +529,8 @@ TOOLS = [
             "type": "object",
             "additionalProperties": False,
             "properties": {
-                "customer": {"type":"string", "description":"Client name, alias, or numeric ID"},
-                "login_customer_id": {"type":"string", "description":"MCC for hierarchy lookup (optional)"}
+                "customer": {"type":"string", "description":"Client name, alias, or numeric ID", "maxLength": 120},
+                "login_customer_id": {"type":"string", "description":"MCC for hierarchy lookup (optional)", "maxLength": 20, "pattern": "^[0-9-]*$"}
             },
             "required": ["customer"]
         }
@@ -474,18 +541,19 @@ TOOLS = [
 TOOLS.append({
     "name": "ping",
     "description": "Health check (public).",
-    "inputSchema": {"type": "object", "properties": {}}
+    "inputSchema": {"type": "object", "additionalProperties": False, "properties": {}}
 })
 
 # Debug: show which MCC header the server will use
 TOOLS.append({
     "name": "debug_login_header",
     "description": "Show which login_customer_id (MCC) the server will use.",
-    "inputSchema": {"type":"object","properties":{}}
+    "inputSchema": {"type":"object","additionalProperties": False,"properties":{}}
 })
 
 def tool_debug_login_header(_args: Dict[str, Any]) -> Dict[str, Any]:
     return {"env_LOGIN_CUSTOMER_ID": LOGIN_CUSTOMER_ID}
+
 
 # ---------- Tool implementations ----------
 def tool_ping(args: Dict[str, Any]) -> Dict[str, Any]:
