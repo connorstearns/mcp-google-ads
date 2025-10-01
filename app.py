@@ -1222,12 +1222,20 @@ async def rpc(request: Request):
 
     public_tools: Set[str] = PUBLIC_TOOLS
 
+    def _sync_protocol_header() -> None:
+        negotiated = getattr(request.state, "mcp_protocol_version", None)
+        if negotiated:
+            headers["MCP-Protocol-Version"] = negotiated
+        elif not headers.get("MCP-Protocol-Version"):
+            headers["MCP-Protocol-Version"] = _latest_supported_protocol()
+
     try:
         payload = await request.json()
         if isinstance(payload, list):
             responses: List[Dict[str, Any]] = []
             for entry in payload:
                 resp = _handle_single_rpc(entry, request, headers, status, public_tools)
+                _sync_protocol_header()
                 if resp is None:
                     continue
                 responses.append(resp)
@@ -1241,6 +1249,7 @@ async def rpc(request: Request):
             return Response(status_code=status_code, headers=headers)
 
         resp = _handle_single_rpc(payload, request, headers, status, public_tools)
+        _sync_protocol_header()
 
         # <— log the headers we’re about to send
         log.info("resp headers: %s", headers)
@@ -1252,6 +1261,7 @@ async def rpc(request: Request):
 
     except Exception as e:
         log.exception("RPC dispatch error")
+        _sync_protocol_header()
         # <— log on error paths too
         log.info("resp headers: %s", headers)
         return JSONResponse(
