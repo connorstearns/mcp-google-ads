@@ -1,4 +1,4 @@
-import os, json, time, random, logging, datetime, re
+import os, json, time, random, logging, datetime, re, uuid
 from typing import Dict, Any, Optional, List, Tuple, Set
 from difflib import get_close_matches
 
@@ -77,10 +77,24 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=False,
-    allow_methods=["GET","POST","OPTIONS"],
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
-    expose_headers=["MCP-Protocol-Version","Mcp-Session-Id"],
+    expose_headers=["MCP-Protocol-Version", "Mcp-Session-Id", "X-Request-ID"],
 )
+
+class RequestId(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        # Trust a client-provided ID if present; otherwise generate one
+        rid = request.headers.get("X-Request-ID") or uuid.uuid4().hex[:12]
+        request.state.request_id = rid
+
+        response = await call_next(request)
+
+        # Echo it back so clients & Cloud Run request logs can correlate
+        response.headers["X-Request-ID"] = rid
+        return response
+
+app.add_middleware(RequestId)
 
 class MCPProtocolHeader(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
@@ -111,11 +125,17 @@ class RPCAudit(BaseHTTPMiddleware):
             except Exception:
                 pass
 
-            ua = request.headers.get("user-agent","")
+            ua = request.headers.get("user-agent", "")
             has_x = "X-MCP-Key" in request.headers
-            auth = request.headers.get("authorization","")
+            auth = request.headers.get("authorization", "")
             has_bearer = auth.lower().startswith("bearer ")
-            log.warning("RPC method=%s ua=%s key:x=%s bearer=%s", method, ua, has_x, has_bearer)
+            rid = getattr(request.state, "request_id", "-")
+
+            # Normal path → INFO, not WARNING
+            log.info(
+                "RPC method=%s ua=%s key:x=%s bearer=%s rid=%s",
+                method, ua, has_x, has_bearer, rid
+            )
 
         return await call_next(request)
 
@@ -1078,6 +1098,8 @@ def _handle_single_rpc(
     if not isinstance(obj, dict):
         return _build_jsonrpc_error(None, -32600, "Invalid Request")
 
+    rid = getattr(request.state, "request_id", "-")
+
     payload = obj
     is_notification = ("id" not in payload and payload.get("jsonrpc") == "2.0" and "method" in payload)
     _id = payload.get("id")
@@ -1162,52 +1184,54 @@ def _handle_single_rpc(
         return success({"tools": visible_tools})
 
     if method == "tools/call":
-        params = payload.get("params") or {}
-        name = params.get("name")
-        args = params.get("arguments") or {}
+    params = payload.get("params") or {}
+    name = params.get("name")
+    args = params.get("arguments") or {}
+
+    # Map tool name -> (callable, title)
+    TOOL_IMPLS = {
+        "fetch_account_tree":   (tool_fetch_account_tree,   "Account tree"),
+        "fetch_metrics":        (tool_fetch_metrics,        "Metrics"),
+        "fetch_campaign_summary": (tool_fetch_campaign_summary, "Campaign summary"),
+        "list_recommendations": (tool_list_recommendations, "Recommendations"),
+        "fetch_search_terms":   (tool_fetch_search_terms,   "Search terms"),
+        "fetch_change_history": (tool_fetch_change_history, "Change history"),
+        "fetch_budget_pacing":  (tool_fetch_budget_pacing,  "Budget pacing"),
+        "list_resources":       (tool_list_resources,       "Resources"),
+        "ping":                 (tool_ping,                 "pong"),
+        "debug_login_header":   (tool_debug_login_header,   "Debug login header"),
+        "echo_short":           (tool_echo_short,           "echo"),
+        "noop_ok":              (tool_noop_ok,              "ok"),
+    }
+
+    try:
+        log.info("tools/call start name=%s", name, rid)
+
+        handler = TOOL_IMPLS.get(name)
+        if not handler:
+            return error(-32601, f"Unknown tool: {name}")
+
+        func, title = handler
+        data = func(args)
+        res = mcp_ok_json(title, data)
+
+        log.info("tools/call ok name=%s", name, rid, rid)
+        return success(res)
+
+    except ValueError as ve:
+        log.warning("tools/call invalid_params name=%s error=%s", name, rid, ve)
+        return error(-32602, f"Invalid params: {ve}")
+
+    except Exception as e:
+        log.exception("tools/call failed name=%s", name, rid)
         try:
-            if name == "fetch_account_tree":
-                data = tool_fetch_account_tree(args); res = mcp_ok_json("Account tree", data)
-            elif name == "fetch_metrics":
-                data = tool_fetch_metrics(args); res = mcp_ok_json("Metrics", data)
-            elif name == "fetch_campaign_summary":
-                data = tool_fetch_campaign_summary(args); res = mcp_ok_json("Campaign summary", data)
-            elif name == "list_recommendations":
-                data = tool_list_recommendations(args); res = mcp_ok_json("Recommendations", data)
-            elif name == "fetch_search_terms":
-                data = tool_fetch_search_terms(args); res = mcp_ok_json("Search terms", data)
-            elif name == "fetch_change_history":
-                data = tool_fetch_change_history(args); res = mcp_ok_json("Change history", data)
-            elif name == "fetch_budget_pacing":
-                data = tool_fetch_budget_pacing(args); res = mcp_ok_json("Budget pacing", data)
-            elif name == "list_resources":
-                data = tool_list_resources(args); res = mcp_ok_json("Resources", data)
-            elif name == "ping":
-                data = tool_ping(args); res = mcp_ok_json("pong", data)
-            elif name == "debug_login_header":
-                data = tool_debug_login_header(args); res = mcp_ok_json("Debug login header", data)
-            elif name == "echo_short":
-                data = tool_echo_short(args); res = mcp_ok_json("echo", data)
-            elif name == "noop_ok":
-                data = tool_noop_ok(args); res = mcp_ok_json("ok", data)
-            else:
-                return error(-32601, f"Unknown tool: {name}")
-            return success(res)
-        except ValueError as ve:
-            return error(-32602, f"Invalid params: {ve}")
-        except Exception as e:
-            log.exception("Tool call failed")
-            try:
-                data = json.loads(str(e))
-            except Exception:
-                data = {"detail": str(e)}
-            if is_notification:
-                return None
-            return {"jsonrpc": "2.0", "id": _id, "error": mcp_err("Google Ads API error", data)}
-
-    return error(-32601, f"Method not found: {method}")
-
-
+            data = json.loads(str(e))
+        except Exception:
+            data = {"detail": str(e)}
+        log.info("tools/call error_data name=%s data=%s", name, data, rid)
+        if is_notification:
+            return None
+        return {"jsonrpc": "2.0", "id": _id, "error": mcp_err("Google Ads API error", data)}
 
 # ---------- JSON-RPC ----------
 @app.post("/")
@@ -1215,7 +1239,6 @@ async def rpc(request: Request):
     proto_header = request.headers.get("MCP-Protocol-Version", MCP_PROTO_DEFAULT)
     headers: Dict[str, str] = {"MCP-Protocol-Version": proto_header}
     status = {"code": 200}
-
     public_tools: Set[str] = PUBLIC_TOOLS
 
     def _sync_protocol_header() -> None:
@@ -1236,8 +1259,8 @@ async def rpc(request: Request):
                     continue
                 responses.append(resp)
 
-            # <— log the headers we’re about to send
-            log.info("resp headers: %s", headers)
+            rid = getattr(request.state, "request_id", "-")
+            log.info("resp headers: %s rid=%s", headers, rid)
 
             if responses:
                 return JSONResponse(responses, status_code=status["code"], headers=headers)
@@ -1247,8 +1270,8 @@ async def rpc(request: Request):
         resp = _handle_single_rpc(payload, request, headers, status, public_tools)
         _sync_protocol_header()
 
-        # <— log the headers we’re about to send
-        log.info("resp headers: %s", headers)
+        rid = getattr(request.state, "request_id", "-")
+        log.info("resp headers: %s rid=%s", headers, rid)
 
         if resp is not None:
             return JSONResponse(resp, status_code=status["code"], headers=headers)
@@ -1258,8 +1281,8 @@ async def rpc(request: Request):
     except Exception as e:
         log.exception("RPC dispatch error")
         _sync_protocol_header()
-        # <— log on error paths too
-        log.info("resp headers: %s", headers)
+        rid = getattr(request.state, "request_id", "-")
+        log.info("resp headers: %s rid=%s", headers, rid)
         return JSONResponse(
             {"jsonrpc": "2.0", "id": None, "error": {"code": -32098, "message": f"RPC dispatch error: {e}"}},
             headers=headers
