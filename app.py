@@ -506,7 +506,7 @@ TOOLS = [
             "required": ["month","target_spend"]
         }
     },
-    {
+        {
         "name": "list_resources",
         "description": "List accessible Google Ads customer accounts for the authenticated user.",
         "inputSchema": {
@@ -950,19 +950,11 @@ def tool_list_resources(args: Dict[str, Any]) -> Dict[str, Any]:
     client = _new_ads_client(login_cid=login)
     svc = client.get_service("CustomerService")
     response = _ads_call(lambda: svc.list_accessible_customers())
-
     customers: List[Dict[str, str]] = []
     for resource_name in response.resource_names:
         customer_id = resource_name.split("/")[-1]
-        customers.append({
-            "resource_name": resource_name,
-            "customer_id": customer_id,
-        })
-
-    return {
-        "count": len(customers),
-        "customers": customers,
-    }
+        customers.append({"resource_name": resource_name, "customer_id": customer_id})
+    return {"count": len(customers), "customers": customers}
 
 def tool_resolve_customer(args: Dict[str, Any]) -> Dict[str, Any]:
     login = (args.get("login_customer_id") or LOGIN_CUSTOMER_ID or "").replace("-", "") or None
@@ -986,16 +978,35 @@ def favicon_png(): return Response(status_code=204)
 @app.get("/favicon.svg", include_in_schema=False)
 def favicon_svg(): return Response(status_code=204)
 
+# Public tools visible without auth (everything else is hidden/gated)
+PUBLIC_TOOLS: Set[str] = {"ping"}
+
+def _is_authed(request: Request) -> bool:
+    """Shared-secret auth check for discovery and other handlers."""
+    if not MCP_SHARED_KEY:
+        return True  # No shared key configured => effectively open
+    auth_hdr = request.headers.get("Authorization", "")
+    bearer_ok = auth_hdr.lower().startswith("bearer ") and auth_hdr.split(" ", 1)[1].strip() == MCP_SHARED_KEY
+    xhdr_ok = request.headers.get("X-MCP-Key", "") == MCP_SHARED_KEY
+    return bearer_ok or xhdr_ok
+
 @app.get("/.well-known/mcp.json")
-def mcp_discovery():
-    auth = {"type": "none"}
+def mcp_discovery(request: Request):
+    # Advertise auth mode
     if MCP_SHARED_KEY:
         auth = {
             "type": "shared-secret",
             "tokenHeader": "Authorization",  # prefer Bearer
             "scheme": "Bearer",
-            "altHeaders": ["X-MCP-Key"]     # optional hint
+            "altHeaders": ["X-MCP-Key"],     # optional secondary header
         }
+    else:
+        auth = {"type": "none"}
+
+    # Filter tools based on auth (hide non-public tools when not authed)
+    authed = _is_authed(request)
+    visible_tools = [t for t in TOOLS if authed or t.get("name") in PUBLIC_TOOLS]
+
     return JSONResponse({
         "mcpVersion": MCP_PROTO_DEFAULT,
         "name": APP_NAME,
@@ -1003,19 +1014,21 @@ def mcp_discovery():
         "auth": auth,
         "capabilities": {"tools": {"listChanged": True}},
         "endpoints": {"rpc": "/"},
-        "tools": TOOLS
+        "tools": visible_tools,
     })
 
 @app.get("/mcp/tools")
-def mcp_tools():
-    return JSONResponse({"tools": TOOLS})
+def mcp_tools(request: Request):
+    """Optional endpoint; mirror discovery's visibility rules."""
+    authed = _is_authed(request)
+    visible_tools = [t for t in TOOLS if authed or t.get("name") in PUBLIC_TOOLS]
+    return JSONResponse({"tools": visible_tools})
 
 def _build_jsonrpc_error(_id: Any, code: int, message: str, data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     body: Dict[str, Any] = {"jsonrpc": "2.0", "id": _id, "error": {"code": code, "message": message}}
     if data is not None:
         body["error"]["data"] = data
     return body
-
 
 def _handle_single_rpc(
     obj: Any,
@@ -1065,11 +1078,13 @@ def _handle_single_rpc(
     if method == "initialize":
         client_proto = (payload.get("params") or {}).get("protocolVersion") or MCP_PROTO_DEFAULT
         headers["MCP-Protocol-Version"] = client_proto
+        authed = _is_authed(request)
+        visible_tools = [t for t in TOOLS if authed or t.get("name") in PUBLIC_TOOLS]
         result = {
             "protocolVersion": client_proto,
             "capabilities": {"tools": {"listChanged": True}},
             "serverInfo": {"name": APP_NAME, "version": APP_VER},
-            "tools": TOOLS
+            "tools": visible_tools
         }
         return success(result)
 
@@ -1077,7 +1092,9 @@ def _handle_single_rpc(
         return success({"ok": True})
 
     if method in ("tools/list", "tools.list", "list_tools", "tools.index"):
-        return success({"tools": TOOLS})
+        authed = _is_authed(request)
+        visible_tools = [t for t in TOOLS if authed or t.get("name") in PUBLIC_TOOLS]
+        return success({"tools": visible_tools})
 
     if method == "tools/call":
         params = payload.get("params") or {}
@@ -1124,6 +1141,7 @@ def _handle_single_rpc(
     return error(-32601, f"Method not found: {method}")
 
 
+
 # ---------- JSON-RPC ----------
 @app.post("/")
 async def rpc(request: Request):
@@ -1131,7 +1149,7 @@ async def rpc(request: Request):
     headers: Dict[str, str] = {"MCP-Protocol-Version": proto_header}
     status = {"code": 200}
 
-    public_tools: Set[str] = {"ping"}
+    public_tools: Set[str] = PUBLIC_TOOLS
 
     try:
         payload = await request.json()
