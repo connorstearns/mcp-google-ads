@@ -1075,6 +1075,8 @@ def _handle_single_rpc(
                 data = tool_ping(args); res = mcp_ok_json("pong", data)
             elif name == "debug_login_header":
                 data = tool_debug_login_header(args); res = mcp_ok_json("Debug login header", data)
+            elif name == "echo_short":
+                data = tool_echo_short(args); res = mcp_ok_json("echo", data)
             else:
                 return error(-32601, f"Unknown tool: {name}")
             return success(res)
