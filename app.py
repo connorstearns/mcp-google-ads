@@ -113,10 +113,9 @@ class RPCAudit(BaseHTTPMiddleware):
 app.add_middleware(RPCAudit)
 
 # ---------- MCP tooling ----------
-def mcp_ok_json(title: str, data: Any) -> Dict[str, Any]:
-    return {"content": [
-        {"type": "json", "json": data},
-    ]}
+def mcp_ok_json(_title: str, data: Any) -> Dict[str, Any]:
+    # Return exactly one content item (json) to keep clients happy
+    return {"content": [{"type": "json", "json": data}]}
 
 def mcp_err(message: str, data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     out = {"message": message}
@@ -544,6 +543,9 @@ TOOLS.append({
     "inputSchema": {"type": "object", "additionalProperties": False, "properties": {}}
 })
 
+def tool_ping(args: Dict[str, Any]) -> Dict[str, Any]:
+    return {"ok": True}  # keep it tiny
+
 # Debug: show which MCC header the server will use
 TOOLS.append({
     "name": "debug_login_header",
@@ -568,6 +570,18 @@ def tool_echo_short(args: Dict[str, Any]) -> Dict[str, Any]:
     m = (args.get("msg") or "").strip()
     if not m: raise ValueError("msg required")
     return {"msg": m}
+
+TOOLS.append({
+  "name": "noop_ok",
+  "description": "Returns a tiny fixed JSON object.",
+  "inputSchema": {"type":"object","additionalProperties":False,"properties":{}}
+})
+def tool_noop_ok(_args: Dict[str, Any]) -> Dict[str, Any]:
+    return {"ok": True}
+
+# dispatcher:
+elif name == "noop_ok":
+    data = tool_noop_ok(args); res = mcp_ok_json("ok", data)
 
 
 # ---------- Tool implementations ----------
@@ -1160,12 +1174,20 @@ async def rpc(request: Request):
                 if resp is None:
                     continue
                 responses.append(resp)
+
+            # <— log the headers we’re about to send
+            log.info("resp headers: %s", headers)
+
             if responses:
                 return JSONResponse(responses, status_code=status["code"], headers=headers)
             status_code = status["code"] if status["code"] != 200 else 204
             return Response(status_code=status_code, headers=headers)
 
         resp = _handle_single_rpc(payload, request, headers, status, public_tools)
+
+        # <— log the headers we’re about to send
+        log.info("resp headers: %s", headers)
+
         if resp is not None:
             return JSONResponse(resp, status_code=status["code"], headers=headers)
         status_code = status["code"] if status["code"] != 200 else 204
@@ -1173,6 +1195,8 @@ async def rpc(request: Request):
 
     except Exception as e:
         log.exception("RPC dispatch error")
+        # <— log on error paths too
+        log.info("resp headers: %s", headers)
         return JSONResponse(
             {"jsonrpc": "2.0", "id": None, "error": {"code": -32098, "message": f"RPC dispatch error: {e}"}},
             headers=headers
