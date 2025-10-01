@@ -596,8 +596,7 @@ TOOLS.append({
 })
 
 # Public tools visible without auth (everything else is gated)
-PUBLIC_TOOLS: Set[str] = {"ping"}  # add "noop_ok" here too if you want it public
-# PUBLIC_TOOLS: Set[str] = {"ping", "noop_ok"}
+PUBLIC_TOOLS: Set[str] = {"ping", "noop_ok"}
 
 # ---------- Tool implementations ----------
 def tool_ping(_args: Dict[str, Any]) -> Dict[str, Any]:
@@ -1018,9 +1017,6 @@ def favicon_ico(): return Response(status_code=204)
 def favicon_png(): return Response(status_code=204)
 @app.get("/favicon.svg", include_in_schema=False)
 def favicon_svg(): return Response(status_code=204)
-
-# Public tools visible without auth (everything else is hidden/gated)
-PUBLIC_TOOLS: Set[str] = {"ping"}
 
 def _is_authed(request: Request) -> bool:
     """Shared-secret auth check for discovery and other handlers."""
