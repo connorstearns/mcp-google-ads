@@ -1118,7 +1118,10 @@ def _handle_single_rpc(
             xhdr_ok = request.headers.get("X-MCP-Key", "") == MCP_SHARED_KEY
 
             if not (bearer_ok or xhdr_ok):
-                log.warning("401 on tools/call tool=%s has_bearer=%s has_xmcp=%s", tool_name, has_bearer, has_xhdr)
+                log.warning(
+                    "401 on tools/call tool=%s has_bearer=%s has_xmcp=%s rid=%s",
+                    tool_name, has_bearer, has_xhdr, rid
+                )
                 status["code"] = 401
                 headers["WWW-Authenticate"] = 'Bearer realm="mcp-google-ads"'
                 if is_notification:
@@ -1184,54 +1187,54 @@ def _handle_single_rpc(
         return success({"tools": visible_tools})
 
     if method == "tools/call":
-    params = payload.get("params") or {}
-    name = params.get("name")
-    args = params.get("arguments") or {}
+        params = payload.get("params") or {}
+        name = params.get("name")
+        args = params.get("arguments") or {}
 
-    # Map tool name -> (callable, title)
-    TOOL_IMPLS = {
-        "fetch_account_tree":   (tool_fetch_account_tree,   "Account tree"),
-        "fetch_metrics":        (tool_fetch_metrics,        "Metrics"),
-        "fetch_campaign_summary": (tool_fetch_campaign_summary, "Campaign summary"),
-        "list_recommendations": (tool_list_recommendations, "Recommendations"),
-        "fetch_search_terms":   (tool_fetch_search_terms,   "Search terms"),
-        "fetch_change_history": (tool_fetch_change_history, "Change history"),
-        "fetch_budget_pacing":  (tool_fetch_budget_pacing,  "Budget pacing"),
-        "list_resources":       (tool_list_resources,       "Resources"),
-        "ping":                 (tool_ping,                 "pong"),
-        "debug_login_header":   (tool_debug_login_header,   "Debug login header"),
-        "echo_short":           (tool_echo_short,           "echo"),
-        "noop_ok":              (tool_noop_ok,              "ok"),
-    }
+        # Map tool name -> (callable, title)
+        TOOL_IMPLS = {
+            "fetch_account_tree":     (tool_fetch_account_tree,     "Account tree"),
+            "fetch_metrics":          (tool_fetch_metrics,          "Metrics"),
+            "fetch_campaign_summary": (tool_fetch_campaign_summary, "Campaign summary"),
+            "list_recommendations":   (tool_list_recommendations,   "Recommendations"),
+            "fetch_search_terms":     (tool_fetch_search_terms,     "Search terms"),
+            "fetch_change_history":   (tool_fetch_change_history,   "Change history"),
+            "fetch_budget_pacing":    (tool_fetch_budget_pacing,    "Budget pacing"),
+            "list_resources":         (tool_list_resources,         "Resources"),
+            "ping":                   (tool_ping,                   "pong"),
+            "debug_login_header":     (tool_debug_login_header,     "Debug login header"),
+            "echo_short":             (tool_echo_short,             "echo"),
+            "noop_ok":                (tool_noop_ok,                "ok"),
+        }
 
-    try:
-        log.info("tools/call start name=%s", name, rid)
-
-        handler = TOOL_IMPLS.get(name)
-        if not handler:
-            return error(-32601, f"Unknown tool: {name}")
-
-        func, title = handler
-        data = func(args)
-        res = mcp_ok_json(title, data)
-
-        log.info("tools/call ok name=%s", name, rid, rid)
-        return success(res)
-
-    except ValueError as ve:
-        log.warning("tools/call invalid_params name=%s error=%s", name, rid, ve)
-        return error(-32602, f"Invalid params: {ve}")
-
-    except Exception as e:
-        log.exception("tools/call failed name=%s", name, rid)
         try:
-            data = json.loads(str(e))
-        except Exception:
-            data = {"detail": str(e)}
-        log.info("tools/call error_data name=%s data=%s", name, data, rid)
-        if is_notification:
-            return None
-        return {"jsonrpc": "2.0", "id": _id, "error": mcp_err("Google Ads API error", data)}
+            log.info("tools/call start name=%s rid=%s", name, rid)
+
+            handler = TOOL_IMPLS.get(name)
+            if not handler:
+                return error(-32601, f"Unknown tool: {name}")
+
+            func, title = handler
+            data = func(args)
+            res  = mcp_ok_json(title, data)
+
+            log.info("tools/call ok name=%s rid=%s", name, rid)
+            return success(res)
+
+        except ValueError as ve:
+            log.warning("tools/call invalid_params name=%s rid=%s error=%s", name, rid, ve)
+            return error(-32602, f"Invalid params: {ve}")
+
+        except Exception as e:
+            log.exception("tools/call failed name=%s rid=%s", name, rid)
+            try:
+                data = json.loads(str(e))
+            except Exception:
+                data = {"detail": str(e)}
+            log.info("tools/call error_data name=%s rid=%s data=%s", name, rid, data)
+            if is_notification:
+                return None
+            return {"jsonrpc": "2.0", "id": _id, "error": mcp_err("Google Ads API error", data)}
 
 # ---------- JSON-RPC ----------
 @app.post("/")
