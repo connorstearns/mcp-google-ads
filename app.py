@@ -1,12 +1,22 @@
-import os, json, time, random, logging, datetime, re, uuid
-from typing import Dict, Any, Optional, List, Tuple, Set
+from __future__ import annotations
+
+import datetime
+import json
+import logging
+import os
+import random
+import re
+import time
+import uuid
 from difflib import get_close_matches
+from typing import Any, Dict, List, Optional, Set
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, PlainTextResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, PlainTextResponse, Response
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.types import Message
+
 
 # Google Ads
 from google.ads.googleads.client import GoogleAdsClient
@@ -84,13 +94,15 @@ app.add_middleware(
 
 class MCPProtocolHeader(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        req_hdr = request.headers.get("MCP-Protocol-Version") or request.headers.get("Mcp-Protocol-Version")
-        request_default = req_hdr or _latest_supported_protocol()
+        requested = (
+            request.headers.get("MCP-Protocol-Version")
+            or request.headers.get("Mcp-Protocol-Version")
+            or _latest_supported_protocol()
+        )
         response = await call_next(request)
         negotiated = getattr(request.state, "mcp_protocol_version", None)
-        final_proto = negotiated or response.headers.get("MCP-Protocol-Version") or request_default
-        if final_proto:
-            response.headers["MCP-Protocol-Version"] = final_proto
+        final_proto = negotiated or response.headers.get("MCP-Protocol-Version") or requested
+        response.headers["MCP-Protocol-Version"] = final_proto
         return response
 
 app.add_middleware(MCPProtocolHeader)
@@ -129,9 +141,10 @@ class RPCAudit(BaseHTTPMiddleware):
 app.add_middleware(RPCAudit)
 
 # ---------- MCP tooling ----------
-def mcp_ok_json(_title: str, data: Any) -> Dict[str, Any]:
-    # Return exactly one content item (json) to keep clients happy
-    return {"content": [{"type": "json", "json": data}]}
+def mcp_ok_text(msg: Any) -> Dict[str, Any]:
+    if not isinstance(msg, str):
+        msg = json.dumps(msg, ensure_ascii=False)
+    return {"content": [{"type": "text", "text": msg}]}
 
 def mcp_err(message: str, data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     out = {"message": message}
@@ -1024,6 +1037,15 @@ def tool_resolve_customer(args: Dict[str, Any]) -> Dict[str, Any]:
     return {"input": target, "resolved_customer_id": resolved}
 
 # ---------- Health & discovery ----------
+def mcp_ok_text(data: Any) -> Dict[str, Any]:
+    """Return a simple text content block (friendly to strict clients)."""
+    if not isinstance(data, str):
+        try:
+            data = json.dumps(data, ensure_ascii=False)
+        except Exception:
+            data = str(data)
+    return {"content": [{"type": "text", "text": data}]}
+
 @app.get("/", include_in_schema=False)
 @app.head("/", include_in_schema=False)
 async def root_get(request: Request):
@@ -1103,7 +1125,6 @@ def _handle_single_rpc(
         return _build_jsonrpc_error(None, -32600, "Invalid Request")
 
     rid = getattr(request.state, "request_id", "-")
-
     payload = obj
     is_notification = ("id" not in payload and payload.get("jsonrpc") == "2.0" and "method" in payload)
     _id = payload.get("id")
@@ -1142,40 +1163,19 @@ def _handle_single_rpc(
             return None
         return _build_jsonrpc_error(_id, code, message, data)
 
+    # ---------------- initialize (permissive during debug) ----------------
     if method == "initialize":
-        params = (payload.get("params") or {})
-        raw_proto = params.get("protocolVersion")
-        if raw_proto is not None and not isinstance(raw_proto, str):
-            latest = _latest_supported_protocol()
-            headers["MCP-Protocol-Version"] = latest
-            request.state.mcp_protocol_version = latest
-            return error(-32602, "protocolVersion must be a string", {"supportedVersions": SUPPORTED_MCP_VERSIONS})
-
-        requested_proto: Optional[str]
-        if raw_proto is None:
-            requested_proto = None
-        else:
-            try:
-                requested_proto = _validate_protocol_version_string(raw_proto)
-            except ValueError:
-                latest = _latest_supported_protocol()
-                headers["MCP-Protocol-Version"] = latest
-                request.state.mcp_protocol_version = latest
-                return error(-32602, "Invalid protocolVersion format", {"supportedVersions": SUPPORTED_MCP_VERSIONS})
-
-        negotiated_proto = _negotiate_protocol_version(requested_proto)
-        if negotiated_proto is None:
-            latest = _latest_supported_protocol()
-            headers["MCP-Protocol-Version"] = latest
-            request.state.mcp_protocol_version = latest
-            return error(-32602, "Unsupported protocolVersion", {"supportedVersions": SUPPORTED_MCP_VERSIONS})
-
-        headers["MCP-Protocol-Version"] = negotiated_proto
-        request.state.mcp_protocol_version = negotiated_proto
+        client_proto = (
+            (payload.get("params") or {}).get("protocolVersion")
+            or request.headers.get("MCP-Protocol-Version")
+            or request.headers.get("Mcp-Protocol-Version")
+            or _latest_supported_protocol()
+        )
+        request.state.mcp_protocol_version = client_proto
         authed = _is_authed(request)
         visible_tools = [t for t in TOOLS if authed or t.get("name") in PUBLIC_TOOLS]
         result = {
-            "protocolVersion": negotiated_proto,
+            "protocolVersion": client_proto,
             "capabilities": {"tools": {"listChanged": True}},
             "serverInfo": {"name": APP_NAME, "version": APP_VER},
             "tools": visible_tools
@@ -1190,25 +1190,28 @@ def _handle_single_rpc(
         visible_tools = [t for t in TOOLS if authed or t.get("name") in PUBLIC_TOOLS]
         return success({"tools": visible_tools})
 
+    # ---------------- tools/call ----------------
     if method == "tools/call":
         params = payload.get("params") or {}
         name = params.get("name")
         args = params.get("arguments") or {}
 
-        # Map tool name -> (callable, title)
+        # Map tool name -> (callable, title, packer)
         TOOL_IMPLS = {
-            "fetch_account_tree":     (tool_fetch_account_tree,     "Account tree"),
-            "fetch_metrics":          (tool_fetch_metrics,          "Metrics"),
-            "fetch_campaign_summary": (tool_fetch_campaign_summary, "Campaign summary"),
-            "list_recommendations":   (tool_list_recommendations,   "Recommendations"),
-            "fetch_search_terms":     (tool_fetch_search_terms,     "Search terms"),
-            "fetch_change_history":   (tool_fetch_change_history,   "Change history"),
-            "fetch_budget_pacing":    (tool_fetch_budget_pacing,    "Budget pacing"),
-            "list_resources":         (tool_list_resources,         "Resources"),
-            "ping":                   (tool_ping,                   "pong"),
-            "debug_login_header":     (tool_debug_login_header,     "Debug login header"),
-            "echo_short":             (tool_echo_short,             "echo"),
-            "noop_ok":                (tool_noop_ok,                "ok"),
+            "fetch_account_tree":     (tool_fetch_account_tree,     "Account tree",     mcp_ok_json),
+            "fetch_metrics":          (tool_fetch_metrics,          "Metrics",          mcp_ok_json),
+            "fetch_campaign_summary": (tool_fetch_campaign_summary, "Campaign summary", mcp_ok_json),
+            "list_recommendations":   (tool_list_recommendations,   "Recommendations",  mcp_ok_json),
+            "fetch_search_terms":     (tool_fetch_search_terms,     "Search terms",     mcp_ok_json),
+            "fetch_change_history":   (tool_fetch_change_history,   "Change history",   mcp_ok_json),
+            "fetch_budget_pacing":    (tool_fetch_budget_pacing,    "Budget pacing",    mcp_ok_json),
+            "list_resources":         (tool_list_resources,         "Resources",        mcp_ok_json),
+
+            # trivial/debug → TEXT
+            "ping":                   (tool_ping,                   "pong",             mcp_ok_text),
+            "debug_login_header":     (tool_debug_login_header,     "Debug login header", mcp_ok_text),
+            "echo_short":             (tool_echo_short,             "echo",             mcp_ok_text),
+            "noop_ok":                (tool_noop_ok,                "ok",               mcp_ok_text),
         }
 
         try:
@@ -1218,9 +1221,14 @@ def _handle_single_rpc(
             if not handler:
                 return error(-32601, f"Unknown tool: {name}")
 
-            func, title = handler
+            func, title, pack = handler
             data = func(args)
-            res = mcp_ok_json(title, data)
+
+            # Pack result: JSON for data tools; TEXT for trivial/debug
+            if pack is mcp_ok_json:
+                res = pack(title, data)
+            else:
+                res = pack(data)
 
             log.info("tools/call ok name=%s rid=%s", name, rid)
             return success(res)
