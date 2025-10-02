@@ -82,20 +82,6 @@ app.add_middleware(
     expose_headers=["MCP-Protocol-Version", "Mcp-Session-Id", "X-Request-ID"],
 )
 
-class RequestId(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next):
-        # Trust a client-provided ID if present; otherwise generate one
-        rid = request.headers.get("X-Request-ID") or uuid.uuid4().hex[:12]
-        request.state.request_id = rid
-
-        response = await call_next(request)
-
-        # Echo it back so clients & Cloud Run request logs can correlate
-        response.headers["X-Request-ID"] = rid
-        return response
-
-app.add_middleware(RequestId)
-
 class MCPProtocolHeader(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         request_default = request.headers.get("MCP-Protocol-Version") or _latest_supported_protocol()
@@ -170,6 +156,20 @@ def _negotiate_protocol_version(requested: Optional[str]) -> Optional[str]:
         if version <= requested:
             return version
     return None
+
+class RequestId(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        # Trust a client-provided ID if present; otherwise generate one
+        rid = request.headers.get("X-Request-ID") or uuid.uuid4().hex[:12]
+        request.state.request_id = rid
+
+        response = await call_next(request)
+
+        # Echo it back so clients & Cloud Run request logs can correlate
+        response.headers["X-Request-ID"] = rid
+        return response
+
+app.add_middleware(RequestId)
 
 
 # ---------- Helpers (segments, entities) ----------
