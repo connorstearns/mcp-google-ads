@@ -1134,6 +1134,7 @@ def _handle_single_rpc(
 
     require_key = bool(MCP_SHARED_KEY)
 
+    # ---- Auth gate for non-public tools ----
     if require_key and method == "tools/call":
         params = (payload.get("params") or {})
         tool_name = (params.get("name") or "").lower()
@@ -1165,7 +1166,7 @@ def _handle_single_rpc(
             return None
         return _build_jsonrpc_error(_id, code, message, data)
 
-    # ---------------- initialize (permissive during debug) ----------------
+    # ---------------- initialize ----------------
     if method == "initialize":
         client_proto = (
             (payload.get("params") or {}).get("protocolVersion")
@@ -1180,23 +1181,25 @@ def _handle_single_rpc(
             "protocolVersion": client_proto,
             "capabilities": {"tools": {"listChanged": True}},
             "serverInfo": {"name": APP_NAME, "version": APP_VER},
-            "tools": visible_tools
+            "tools": visible_tools,
         }
         return success(result)
 
+    # ---------------- initialized ack ----------------
     if method in ("initialized", "notifications/initialized"):
         return success({"ok": True})
 
+    # ---------------- tools/list ----------------
     if method in ("tools/list", "tools.list", "list_tools", "tools.index"):
         authed = _is_authed(request)
         visible_tools = [t for t in TOOLS if authed or t.get("name") in PUBLIC_TOOLS]
         return success({"tools": visible_tools})
 
-        # ---------------- tools/call ----------------
+    # ---------------- tools/call ----------------
     if method == "tools/call":
         params = payload.get("params") or {}
-        name   = params.get("name")
-        args   = params.get("arguments") or {}
+        name = params.get("name")
+        args = params.get("arguments") or {}
 
         # Map tool name -> (callable, title)
         TOOL_IMPLS = {
@@ -1226,7 +1229,7 @@ def _handle_single_rpc(
             func, title = handler
             data = func(args)
 
-            # Always return a single content item. Using JSON everywhere keeps clients happy.
+            # Always return a single JSON content item for strict MCP clients.
             res = mcp_ok_json(title, data)
 
             log.info("tools/call ok name=%s rid=%s", name, rid)
@@ -1246,6 +1249,9 @@ def _handle_single_rpc(
             if is_notification:
                 return None
             return {"jsonrpc": "2.0", "id": _id, "error": mcp_err("Google Ads API error", data)}
+
+    # ---------------- fallback ----------------
+    return error(-32601, f"Method not found: {method}")
 
 # ---------- JSON-RPC ----------
 @app.post("/")
