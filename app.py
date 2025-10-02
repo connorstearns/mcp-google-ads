@@ -1192,7 +1192,7 @@ def _handle_single_rpc(
 
     # ---------------- initialized ack ----------------
     if method in ("initialized", "notifications/initialized"):
-        return success({"ok": True})
+        return {"jsonrpc": "2.0", "id": _id or "notif", "result": {"ok": True}}
 
     # ---------------- tools/list ----------------
     if method in ("tools/list", "tools.list", "list_tools", "tools.index"):
@@ -1286,9 +1286,8 @@ async def rpc(request: Request):
             log.info("resp headers: %s rid=%s", headers, rid)
 
             if responses:
-                return JSONResponse(responses, status_code=200, headers=headers)
-            # All notifications → 204
-            return Response(status_code=204, headers=headers)
+                return JSONResponse(responses, status_code=status["code"], headers=headers)
+            return JSONResponse([], status_code=200, headers=headers)
 
         # Single
         resp = _handle_single_rpc(payload, request, headers, status, public_tools)
@@ -1298,9 +1297,8 @@ async def rpc(request: Request):
         log.info("resp headers: %s rid=%s", headers, rid)
 
         if resp is not None:
-            return JSONResponse(resp, status_code=200, headers=headers)
-        # Notification → 204
-        return Response(status_code=204, headers=headers)
+            return JSONResponse(resp, status_code=status["code"], headers=headers)
+        return Response(status_code=200, headers=headers)
 
     except Exception as e:
         log.exception("RPC dispatch error")
