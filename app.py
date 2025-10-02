@@ -3,36 +3,42 @@ from __future__ import annotations
 
 import json
 import os
-import datetime
-from typing import Any, Dict, Optional, List, Tuple
+from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, Response
 
-# --- Google Ads SDK ---
+# Google Ads
 from google.ads.googleads.client import GoogleAdsClient
 from google.ads.googleads.errors import GoogleAdsException
 
-APP_NAME = "mcp-google-ads"
-APP_VER = "0.1.0"
-MCP_PROTOCOL = "2024-11-05"
 
-# ---------------- Env & Google Ads client helpers ----------------
-DEV_TOKEN         = os.getenv("GOOGLE_ADS_DEVELOPER_TOKEN", "")
-CLIENT_ID         = os.getenv("GOOGLE_ADS_CLIENT_ID", "")
-CLIENT_SECRET     = os.getenv("GOOGLE_ADS_CLIENT_SECRET", "")
-REFRESH_TOKEN     = os.getenv("GOOGLE_ADS_REFRESH_TOKEN", "")
+# -------------------- App & MCP basics --------------------
+APP_NAME = "mcp-google-ads"
+APP_VER = "0.2.0"
+MCP_PROTO_DEFAULT = "2024-11-05"
+
+app = FastAPI()
+
+
+# -------------------- Env & Ads client --------------------
+DEV_TOKEN = os.getenv("GOOGLE_ADS_DEVELOPER_TOKEN", "")
+CLIENT_ID = os.getenv("GOOGLE_ADS_CLIENT_ID", "")
+CLIENT_SECRET = os.getenv("GOOGLE_ADS_CLIENT_SECRET", "")
+REFRESH_TOKEN = os.getenv("GOOGLE_ADS_REFRESH_TOKEN", "")
 LOGIN_CUSTOMER_ID = (os.getenv("GOOGLE_ADS_LOGIN_CUSTOMER_ID", "") or "").replace("-", "").strip()
 
-def _require_env():
+
+def _require_env() -> None:
     missing = [k for k, v in [
         ("GOOGLE_ADS_DEVELOPER_TOKEN", DEV_TOKEN),
-        ("GOOGLE_ADS_CLIENT_ID",       CLIENT_ID),
-        ("GOOGLE_ADS_CLIENT_SECRET",   CLIENT_SECRET),
-        ("GOOGLE_ADS_REFRESH_TOKEN",   REFRESH_TOKEN),
+        ("GOOGLE_ADS_CLIENT_ID", CLIENT_ID),
+        ("GOOGLE_ADS_CLIENT_SECRET", CLIENT_SECRET),
+        ("GOOGLE_ADS_REFRESH_TOKEN", REFRESH_TOKEN),
     ] if not v]
     if missing:
         raise RuntimeError(f"Missing required env: {', '.join(missing)}")
+
 
 def _new_ads_client(login_cid: Optional[str] = None) -> GoogleAdsClient:
     _require_env()
@@ -48,78 +54,24 @@ def _new_ads_client(login_cid: Optional[str] = None) -> GoogleAdsClient:
         cfg["login_customer_id"] = final_login
     return GoogleAdsClient.load_from_dict(cfg)
 
-# ---------------- Minimal FastAPI app ----------------
-app = FastAPI()
 
-@app.get("/", include_in_schema=False)
-async def root():
-    return PlainTextResponse("ok")
+def _money(micros: int | None) -> float:
+    return round((micros or 0) / 1_000_000, 6)
 
-@app.get("/.well-known/mcp.json")
-def discovery():
-    # Simple, no-auth discovery
-    return JSONResponse({
-        "mcpVersion": MCP_PROTOCOL,
-        "name": APP_NAME,
-        "version": APP_VER,
-        "auth": {"type": "none"},
-        "capabilities": {"tools": {"listChanged": True}},
-        "endpoints": {"rpc": "/"},
-        "tools": TOOLS,  # defined below
-    })
 
-# ---------------- MCP helpers (text-only content) ----------------
-def mcp_ok_text(data: Any) -> Dict[str, Any]:
-    # Always return a single text item (stringify dicts)
-    if not isinstance(data, str):
-        try:
-            data = json.dumps(data, ensure_ascii=False)
-        except Exception:
-            data = str(data)
-    return {"content": [{"type": "text", "text": data}]}
-
-def mcp_err(message: str, data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    return {"code": -32000, "message": message, "data": data or {}}
-
-# ---------------- Tools ----------------
-TOOLS: List[Dict[str, Any]] = [
-    {
-        "name": "ping",
-        "description": "Health check.",
-        "inputSchema": {"type": "object", "additionalProperties": False, "properties": {}},
-    },
-    {
-        "name": "list_resources",
-        "description": "List accessible Google Ads customer accounts for the authenticated user.",
-        "inputSchema": {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "login_customer_id": {
-                    "type": "string",
-                    "description": "Optional MCC header override",
-                    "maxLength": 20,
-                    "pattern": "^[0-9-]*$"
-                }
-            }
-        }
-    },
-]
-
-# ---- Implementations ----
+# -------------------- Minimal tools --------------------
 def tool_ping(_args: Dict[str, Any]) -> Dict[str, Any]:
-    return {"ok": True, "time": datetime.datetime.utcnow().isoformat() + "Z"}
+    return {"ok": True}
 
-def tool_list_resources(args: Dict[str, Any]) -> Dict[str, Any]:
-    login = (args.get("login_customer_id") or LOGIN_CUSTOMER_ID or "").replace("-", "") or None
+
+def tool_list_resources(_args: Dict[str, Any]) -> Dict[str, Any]:
     try:
-        client = _new_ads_client(login_cid=login)
+        client = _new_ads_client()
         svc = client.get_service("CustomerService")
         resp = svc.list_accessible_customers()
         customers: List[Dict[str, str]] = []
-        for resource_name in resp.resource_names:
-            customer_id = resource_name.split("/")[-1]
-            customers.append({"resource_name": resource_name, "customer_id": customer_id})
+        for rn in resp.resource_names:
+            customers.append({"resource_name": rn, "customer_id": rn.split("/")[-1]})
         return {"count": len(customers), "customers": customers}
     except GoogleAdsException as e:
         status = e.error.code().name if hasattr(e, "error") else "UNKNOWN"
@@ -134,12 +86,296 @@ def tool_list_resources(args: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as e:
         return {"error": {"detail": str(e)}}
 
-TOOL_IMPLS: Dict[str, Any] = {
-    "ping":           (tool_ping, "pong"),
-    "list_resources": (tool_list_resources, "Resources"),
+
+def tool_fetch_campaign_summary(args: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Inputs (all optional, but customer_id strongly recommended):
+      customer_id: "1234567890"
+      login_customer_id: MCC header override
+      date_preset: TODAY|YESTERDAY|LAST_7_DAYS|LAST_30_DAYS|THIS_MONTH|LAST_MONTH
+      time_range: {"since":"YYYY-MM-DD","until":"YYYY-MM-DD"}  # overrides date_preset
+    """
+    login = (args.get("login_customer_id") or LOGIN_CUSTOMER_ID or "").replace("-", "") or None
+    customer_id = (args.get("customer_id") or "").replace("-", "") or ""
+    if not customer_id:
+        return {"error": {"detail": "customer_id required"}}
+
+    date_preset = (args.get("date_preset") or "").upper().strip()
+    tr = args.get("time_range") or {}
+    if tr.get("since") and tr.get("until"):
+        where_time = f" segments.date BETWEEN '{tr['since']}' AND '{tr['until']}' "
+    elif date_preset in {"TODAY", "YESTERDAY", "LAST_7_DAYS", "LAST_30_DAYS", "THIS_MONTH", "LAST_MONTH"}:
+        where_time = f" segments.date DURING {date_preset} "
+    else:
+        where_time = " segments.date DURING LAST_30_DAYS "
+
+    q = f"""
+    SELECT
+      campaign.id, campaign.name, campaign.status,
+      metrics.impressions, metrics.clicks, metrics.cost_micros,
+      metrics.conversions, metrics.conversions_value
+    FROM campaign
+    WHERE {where_time}
+    """
+
+    try:
+        client = _new_ads_client(login_cid=login)
+        svc = client.get_service("GoogleAdsService")
+        resp = svc.search(request={"customer_id": customer_id, "query": q})
+
+        out: List[Dict[str, Any]] = []
+        for r in resp:
+            cost = _money(getattr(r.metrics, "cost_micros", 0))
+            imps = int(getattr(r.metrics, "impressions", 0) or 0)
+            clicks = int(getattr(r.metrics, "clicks", 0) or 0)
+            conv = float(getattr(r.metrics, "conversions", 0.0) or 0.0)
+            conv_val = float(getattr(r.metrics, "conversions_value", 0.0) or 0.0)
+            ctr = (clicks / imps * 100) if imps else 0.0
+            cpc = (cost / clicks) if clicks else 0.0
+            cpa = (cost / conv) if conv else 0.0
+            roas = (conv_val / cost) if cost > 0 else 0.0
+            out.append({
+                "campaign_id": str(r.campaign.id),
+                "campaign_name": r.campaign.name,
+                "status": r.campaign.status.name,
+                "impressions": imps,
+                "clicks": clicks,
+                "cost": round(cost, 2),
+                "conversions": round(conv, 2),
+                "conv_value": round(conv_val, 2),
+                "ctr_pct": round(ctr, 2),
+                "cpc": round(cpc, 2),
+                "cpa": round(cpa, 2),
+                "roas": round(roas, 2),
+            })
+        return {"query": q, "rows": out}
+    except GoogleAdsException as e:
+        status = e.error.code().name if hasattr(e, "error") else "UNKNOWN"
+        rid = getattr(e, "request_id", None)
+        details = {"status": status, "request_id": rid}
+        try:
+            if getattr(e, "failure", None) and e.failure.errors:
+                details["errors"] = [{"message": er.message} for er in e.failure.errors]
+        except Exception:
+            pass
+        return {"error": details}
+    except Exception as e:
+        return {"error": {"detail": str(e)}}
+
+
+ENTITY_FROM = {
+    "account": "customer",
+    "campaign": "campaign",
+    "ad_group": "ad_group",
+    "ad": "ad_group_ad",
 }
 
-# ---------------- Minimal JSON-RPC ----------------
+
+def tool_fetch_metrics(args: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Inputs:
+      customer_id (required)
+      entity: account|campaign|ad_group|ad (default campaign)
+      ids: ["123","456"] optional
+      fields: GAQL fields list (default common set)
+      date_preset OR time_range like above
+      login_customer_id optional
+    """
+    login = (args.get("login_customer_id") or LOGIN_CUSTOMER_ID or "").replace("-", "") or None
+    customer_id = (args.get("customer_id") or "").replace("-", "") or ""
+    if not customer_id:
+        return {"error": {"detail": "customer_id required"}}
+
+    entity = (args.get("entity") or "campaign").lower()
+    if entity not in ENTITY_FROM:
+        return {"error": {"detail": f"invalid entity '{entity}'"}}
+
+    fields = args.get("fields") or [
+        "metrics.cost_micros",
+        "metrics.clicks",
+        "metrics.impressions",
+        "metrics.conversions",
+        "metrics.conversions_value",
+    ]
+    ids = [str(x).replace("-", "") for x in (args.get("ids") or [])]
+
+    date_preset = (args.get("date_preset") or "").upper().strip()
+    tr = args.get("time_range") or {}
+    if tr.get("since") and tr.get("until"):
+        where_time = f" segments.date BETWEEN '{tr['since']}' AND '{tr['until']}' "
+    elif date_preset in {"TODAY", "YESTERDAY", "LAST_7_DAYS", "LAST_30_DAYS", "THIS_MONTH", "LAST_MONTH"}:
+        where_time = f" segments.date DURING {date_preset} "
+    else:
+        where_time = " segments.date DURING LAST_30_DAYS "
+
+    id_col = {
+        "account": "customer.id",
+        "campaign": "campaign.id",
+        "ad_group": "ad_group.id",
+        "ad": "ad_group_ad.ad.id",
+    }[entity]
+    id_clause = f" AND {id_col} IN ({','.join(ids)}) " if ids else ""
+
+    base_cols = {
+        "account": ["customer.id", "customer.descriptive_name"],
+        "campaign": ["campaign.id", "campaign.name", "campaign.status"],
+        "ad_group": ["ad_group.id", "ad_group.name", "ad_group.status", "campaign.id", "campaign.name"],
+        "ad": ["ad_group_ad.ad.id", "ad_group.id", "ad_group.name", "campaign.id", "campaign.name"],
+    }[entity]
+
+    select_cols = base_cols + fields
+    frm = ENTITY_FROM[entity]
+    q = f"SELECT {', '.join(select_cols)} FROM {frm} WHERE {where_time}{id_clause}"
+
+    try:
+        client = _new_ads_client(login_cid=login)
+        svc = client.get_service("GoogleAdsService")
+        resp = svc.search(request={"customer_id": customer_id, "query": q})
+
+        out: List[Dict[str, Any]] = []
+        for r in resp:
+            row: Dict[str, Any] = {}
+            if entity == "account":
+                row["customer_id"] = str(r.customer.id)
+                row["customer_name"] = r.customer.descriptive_name
+            elif entity == "campaign":
+                row["campaign_id"] = str(r.campaign.id)
+                row["campaign_name"] = r.campaign.name
+                row["campaign_status"] = r.campaign.status.name
+            elif entity == "ad_group":
+                row["ad_group_id"] = str(r.ad_group.id)
+                row["ad_group_name"] = r.ad_group.name
+                row["ad_group_status"] = r.ad_group.status.name
+                row["campaign_id"] = str(r.campaign.id)
+                row["campaign_name"] = r.campaign.name
+            else:
+                row["ad_id"] = str(r.ad_group_ad.ad.id)
+                row["ad_group_id"] = str(r.ad_group.id)
+                row["ad_group_name"] = r.ad_group.name
+                row["campaign_id"] = str(r.campaign.id)
+                row["campaign_name"] = r.campaign.name
+
+            m = r.metrics
+            row.update({
+                "cost": _money(getattr(m, "cost_micros", 0)),
+                "impressions": int(getattr(m, "impressions", 0) or 0),
+                "clicks": int(getattr(m, "clicks", 0) or 0),
+                "conversions": float(getattr(m, "conversions", 0.0) or 0.0),
+                "conversions_value": float(getattr(m, "conversions_value", 0.0) or 0.0),
+            })
+            out.append(row)
+
+        return {"query": q, "rows": out}
+    except GoogleAdsException as e:
+        status = e.error.code().name if hasattr(e, "error") else "UNKNOWN"
+        rid = getattr(e, "request_id", None)
+        details = {"status": status, "request_id": rid}
+        try:
+            if getattr(e, "failure", None) and e.failure.errors:
+                details["errors"] = [{"message": er.message} for er in e.failure.errors]
+        except Exception:
+            pass
+        return {"error": details}
+    except Exception as e:
+        return {"error": {"detail": str(e)}}
+
+
+# -------------------- Tool registry --------------------
+TOOLS: List[Dict[str, Any]] = [
+    {
+        "name": "ping",
+        "description": "Health check.",
+        "inputSchema": {"type": "object", "additionalProperties": False, "properties": {}},
+    },
+    {
+        "name": "list_resources",
+        "description": "List accessible Google Ads customer accounts.",
+        "inputSchema": {"type": "object", "additionalProperties": False, "properties": {}},
+    },
+    {
+        "name": "fetch_campaign_summary",
+        "description": "Per-campaign KPIs with simple ctr/cpc/cpa/roas.",
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "customer_id": {"type": "string"},
+                "login_customer_id": {"type": "string"},
+                "date_preset": {"type": "string"},
+                "time_range": {
+                    "type": "object",
+                    "properties": {"since": {"type": "string"}, "until": {"type": "string"}},
+                },
+            },
+        },
+    },
+    {
+        "name": "fetch_metrics",
+        "description": "Generic metrics for account/campaign/ad_group/ad.",
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "customer_id": {"type": "string"},
+                "entity": {"type": "string", "enum": ["account", "campaign", "ad_group", "ad"], "default": "campaign"},
+                "ids": {"type": "array", "items": {"type": "string"}},
+                "fields": {"type": "array", "items": {"type": "string"}},
+                "date_preset": {"type": "string"},
+                "time_range": {
+                    "type": "object",
+                    "properties": {"since": {"type": "string"}, "until": {"type": "string"}},
+                },
+                "login_customer_id": {"type": "string"},
+            },
+        },
+    },
+]
+
+
+# -------------------- Discovery (minimal) --------------------
+@app.get("/", include_in_schema=False)
+@app.head("/", include_in_schema=False)
+def root(request: Request):
+    if request.method == "HEAD":
+        return PlainTextResponse("")
+    return PlainTextResponse("ok")
+
+
+@app.get("/.well-known/mcp.json")
+def mcp_discovery():
+    return JSONResponse({
+        "mcpVersion": MCP_PROTO_DEFAULT,
+        "name": APP_NAME,
+        "version": APP_VER,
+        "auth": {"type": "none"},
+        "capabilities": {"tools": {"listChanged": True}},
+        "endpoints": {"rpc": "/"},
+        "tools": TOOLS,
+    })
+
+
+# -------------------- JSON-RPC (initialize, tools/list, tools/call) --------------------
+def _pack_text(data: Any) -> Dict[str, Any]:
+    # Text-only response (works with strict MCP clients)
+    try:
+        text = data if isinstance(data, str) else json.dumps(data, ensure_ascii=False)
+    except Exception:
+        text = str(data)
+    return {"content": [{"type": "text", "text": text}]}
+
+
+def _call_tool(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+    if name == "ping":
+        return _pack_text(tool_ping(args))
+    if name == "list_resources":
+        return _pack_text(tool_list_resources(args))
+    if name == "fetch_campaign_summary":
+        return _pack_text(tool_fetch_campaign_summary(args))
+    if name == "fetch_metrics":
+        return _pack_text(tool_fetch_metrics(args))
+    return {"error": {"code": -32601, "message": f"Unknown tool: {name}"}}
+
+
 @app.post("/")
 async def rpc(request: Request):
     try:
@@ -148,72 +384,56 @@ async def rpc(request: Request):
         return JSONResponse({"jsonrpc": "2.0", "id": None,
                              "error": {"code": -32700, "message": "Parse error"}})
 
-    # Batch
+    def handle(obj: Dict[str, Any]) -> Dict[str, Any] | None:
+        if not isinstance(obj, dict):
+            return {"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "Invalid Request"}}
+
+        _id = obj.get("id")
+        method = (obj.get("method") or "").lower()
+
+        if method == "initialize":
+            client_proto = (obj.get("params") or {}).get("protocolVersion") or MCP_PROTO_DEFAULT
+            result = {
+                "protocolVersion": client_proto,
+                "capabilities": {"tools": {"listChanged": True}},
+                "serverInfo": {"name": APP_NAME, "version": APP_VER},
+                "tools": TOOLS,
+            }
+            return {"jsonrpc": "2.0", "id": _id, "result": result}
+
+        if method in ("initialized", "notifications/initialized"):
+            return {"jsonrpc": "2.0", "id": _id, "result": {"ok": True}}
+
+        if method in ("tools/list", "tools.list", "list_tools", "tools.index"):
+            return {"jsonrpc": "2.0", "id": _id, "result": {"tools": TOOLS}}
+
+        if method == "tools/call":
+            params = obj.get("params") or {}
+            name = params.get("name")
+            args = params.get("arguments") or {}
+            res = _call_tool(name, args)
+            if "error" in res and "content" not in res:
+                return {"jsonrpc": "2.0", "id": _id, "error": res["error"]}
+            return {"jsonrpc": "2.0", "id": _id, "result": res}
+
+        # unknown
+        return {"jsonrpc": "2.0", "id": _id, "error": {"code": -32601, "message": f"Method not found: {method}"}}
+
+    # batch support
     if isinstance(payload, list):
-        results = []
-        for obj in payload:
-            res = await _handle_one(obj)
-            if res is not None:
-                results.append(res)
-        return JSONResponse(results if results else [], status_code=200)
+        out: List[Dict[str, Any]] = []
+        for entry in payload:
+            resp = handle(entry)
+            if resp is not None:
+                out.append(resp)
+        return JSONResponse(out if out else [], status_code=200)
 
-    # Single
-    res = await _handle_one(payload)
-    return JSONResponse(res if res is not None else {}, status_code=200)
+    # single
+    resp = handle(payload)
+    return JSONResponse(resp if resp is not None else {}, status_code=200)
 
-async def _handle_one(obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    if not isinstance(obj, dict):
-        return {"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "Invalid Request"}}
 
-    _id = obj.get("id")
-    method = (obj.get("method") or "").lower()
-    params = obj.get("params") or {}
-
-    def ok(result: Dict[str, Any]) -> Dict[str, Any]:
-        return {"jsonrpc": "2.0", "id": _id, "result": result}
-
-    def err(code: int, message: str, data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        out = {"jsonrpc": "2.0", "id": _id, "error": {"code": code, "message": message}}
-        if data is not None:
-            out["error"]["data"] = data
-        return out
-
-    # initialize
-    if method == "initialize":
-        result = {
-            "protocolVersion": MCP_PROTOCOL,
-            "capabilities": {"tools": {"listChanged": True}},
-            "serverInfo": {"name": APP_NAME, "version": APP_VER},
-            "tools": TOOLS,
-        }
-        return ok(result)
-
-    # initialized ack
-    if method in ("initialized", "notifications/initialized"):
-        return ok({"ok": True})
-
-    # tools/list
-    if method in ("tools/list", "tools.list", "list_tools", "tools.index"):
-        return ok({"tools": TOOLS})
-
-    # tools/call
-    if method == "tools/call":
-        name = params.get("name")
-        args = params.get("arguments") or {}
-        impl = TOOL_IMPLS.get(name)
-        if not impl:
-            return err(-32601, f"Unknown tool: {name}")
-        func, title = impl
-        try:
-            data = func(args)
-            return ok(mcp_ok_text({"title": title, "data": data}))
-        except Exception as e:
-            return {"jsonrpc": "2.0", "id": _id, "error": mcp_err("Tool error", {"detail": str(e)})}
-
-    # unknown method
-    return err(-32601, f"Method not found: {method}")
-
-# ---------------- Local dev ----------------
+# -------------------- Local dev --------------------
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
