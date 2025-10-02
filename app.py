@@ -82,7 +82,7 @@ def _ga_search(svc, customer_id: str, query: str, page_size: Optional[int] = Non
 # ---------- FastAPI base ----------
 app = FastAPI()
 
-# CORS (dev-open now; lock down later)
+# 1) CORS (outermost)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -92,21 +92,18 @@ app.add_middleware(
     expose_headers=["MCP-Protocol-Version", "Mcp-Session-Id", "X-Request-ID"],
 )
 
-class MCPProtocolHeader(BaseHTTPMiddleware):
+# 2) Request ID (so downstream middlewares & handlers can use rid)
+class RequestId(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        requested = (
-            request.headers.get("MCP-Protocol-Version")
-            or request.headers.get("Mcp-Protocol-Version")
-            or _latest_supported_protocol()
-        )
+        rid = request.headers.get("X-Request-ID") or uuid.uuid4().hex[:12]
+        request.state.request_id = rid
         response = await call_next(request)
-        negotiated = getattr(request.state, "mcp_protocol_version", None)
-        final_proto = negotiated or response.headers.get("MCP-Protocol-Version") or requested
-        response.headers["MCP-Protocol-Version"] = final_proto
+        response.headers["X-Request-ID"] = rid
         return response
 
-app.add_middleware(MCPProtocolHeader)
+app.add_middleware(RequestId)
 
+# 3) RPC audit logging (uses rid)
 class RPCAudit(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         if request.url.path == "/" and request.method == "POST":
@@ -130,7 +127,6 @@ class RPCAudit(BaseHTTPMiddleware):
             has_bearer = auth.lower().startswith("bearer ")
             rid = getattr(request.state, "request_id", "-")
 
-            # Normal path → INFO, not WARNING
             log.info(
                 "RPC method=%s ua=%s key:x=%s bearer=%s rid=%s",
                 method, ua, has_x, has_bearer, rid
@@ -140,16 +136,31 @@ class RPCAudit(BaseHTTPMiddleware):
 
 app.add_middleware(RPCAudit)
 
+# 4) MCP protocol header (innermost so it can finalize the header)
+class MCPProtocolHeader(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        requested = (
+            request.headers.get("MCP-Protocol-Version")
+            or request.headers.get("Mcp-Protocol-Version")
+            or _latest_supported_protocol()
+        )
+        response = await call_next(request)
+        negotiated = getattr(request.state, "mcp_protocol_version", None)
+        final_proto = negotiated or response.headers.get("MCP-Protocol-Version") or requested
+        response.headers["MCP-Protocol-Version"] = final_proto
+        return response
+
+app.add_middleware(MCPProtocolHeader)
+
 # ---------- MCP tooling ----------
-def mcp_ok_text(msg: Any) -> Dict[str, Any]:
-    if not isinstance(msg, str):
-        msg = json.dumps(msg, ensure_ascii=False)
-    return {"content": [{"type": "text", "text": msg}]}
+def mcp_ok_json(_title: str, data: Any) -> Dict[str, Any]:
+    # Return exactly one content item (json) to keep clients happy
+    return {"content": [{"type": "json", "json": data}]}
+
+def mcp_ok_text(text: str) -> Dict[str, Any]:
+    return {"content": [{"type": "text", "text": text}]}
 
 def mcp_err(message: str, data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    out = {"message": message}
-    if data is not None:
-        out["data"] = data
     return {"code": -32000, "message": message, "data": data or {}}
 
 def _validate_protocol_version_string(version: str) -> str:
@@ -1037,15 +1048,6 @@ def tool_resolve_customer(args: Dict[str, Any]) -> Dict[str, Any]:
     return {"input": target, "resolved_customer_id": resolved}
 
 # ---------- Health & discovery ----------
-def mcp_ok_text(data: Any) -> Dict[str, Any]:
-    """Return a simple text content block (friendly to strict clients)."""
-    if not isinstance(data, str):
-        try:
-            data = json.dumps(data, ensure_ascii=False)
-        except Exception:
-            data = str(data)
-    return {"content": [{"type": "text", "text": data}]}
-
 @app.get("/", include_in_schema=False)
 @app.head("/", include_in_schema=False)
 async def root_get(request: Request):
@@ -1191,65 +1193,56 @@ def _handle_single_rpc(
         return success({"tools": visible_tools})
 
     # ---------------- tools/call ----------------
-    if method == "tools/call":
-        params = payload.get("params") or {}
-        name = params.get("name")
-        args = params.get("arguments") or {}
+   if method == "tools/call":
+       params = payload.get("params") or {}
+       name   = params.get("name")
+       args   = params.get("arguments") or {}
 
-        # Map tool name -> (callable, title, packer)
-        TOOL_IMPLS = {
-            "fetch_account_tree":     (tool_fetch_account_tree,     "Account tree",     mcp_ok_json),
-            "fetch_metrics":          (tool_fetch_metrics,          "Metrics",          mcp_ok_json),
-            "fetch_campaign_summary": (tool_fetch_campaign_summary, "Campaign summary", mcp_ok_json),
-            "list_recommendations":   (tool_list_recommendations,   "Recommendations",  mcp_ok_json),
-            "fetch_search_terms":     (tool_fetch_search_terms,     "Search terms",     mcp_ok_json),
-            "fetch_change_history":   (tool_fetch_change_history,   "Change history",   mcp_ok_json),
-            "fetch_budget_pacing":    (tool_fetch_budget_pacing,    "Budget pacing",    mcp_ok_json),
-            "list_resources":         (tool_list_resources,         "Resources",        mcp_ok_json),
+    TOOL_IMPLS = {
+        "fetch_account_tree":     (tool_fetch_account_tree,     "Account tree"),
+        "fetch_metrics":          (tool_fetch_metrics,          "Metrics"),
+        "fetch_campaign_summary": (tool_fetch_campaign_summary, "Campaign summary"),
+        "list_recommendations":   (tool_list_recommendations,   "Recommendations"),
+        "fetch_search_terms":     (tool_fetch_search_terms,     "Search terms"),
+        "fetch_change_history":   (tool_fetch_change_history,   "Change history"),
+        "fetch_budget_pacing":    (tool_fetch_budget_pacing,    "Budget pacing"),
+        "list_resources":         (tool_list_resources,         "Resources"),
+        "resolve_customer":       (tool_resolve_customer,       "Resolved customer"),
+        "ping":                   (tool_ping,                   "pong"),
+        "debug_login_header":     (tool_debug_login_header,     "Debug login header"),
+        "echo_short":             (tool_echo_short,             "echo"),
+        "noop_ok":                (tool_noop_ok,                "ok"),
+    }
 
-            # trivial/debug → TEXT
-            "ping":                   (tool_ping,                   "pong",             mcp_ok_text),
-            "debug_login_header":     (tool_debug_login_header,     "Debug login header", mcp_ok_text),
-            "echo_short":             (tool_echo_short,             "echo",             mcp_ok_text),
-            "noop_ok":                (tool_noop_ok,                "ok",               mcp_ok_text),
-        }
+    try:
+        log.info("tools/call start name=%s rid=%s", name, rid)
 
+        handler = TOOL_IMPLS.get(name)
+        if not handler:
+            return error(-32601, f"Unknown tool: {name}")
+
+        func, title = handler
+        data = func(args)
+        res  = mcp_ok_json(title, data)
+
+        log.info("tools/call ok name=%s rid=%s", name, rid)
+        return success(res)
+
+    except ValueError as ve:
+        log.warning("tools/call invalid_params name=%s rid=%s error=%s", name, rid, ve)
+        return error(-32602, f"Invalid params: {ve}")
+
+    except Exception as e:
+        log.exception("tools/call failed name=%s rid=%s", name, rid)
         try:
-            log.info("tools/call start name=%s rid=%s", name, rid)
+            data = json.loads(str(e))
+        except Exception:
+            data = {"detail": str(e)}
+        log.info("tools/call error_data name=%s rid=%s data=%s", name, rid, data)
+        if is_notification:
+            return None
+        return {"jsonrpc": "2.0", "id": _id, "error": mcp_err("Google Ads API error", data)}
 
-            handler = TOOL_IMPLS.get(name)
-            if not handler:
-                return error(-32601, f"Unknown tool: {name}")
-
-            func, title, pack = handler
-            data = func(args)
-
-            # Pack result: JSON for data tools; TEXT for trivial/debug
-            if pack is mcp_ok_json:
-                res = pack(title, data)
-            else:
-                res = pack(data)
-
-            log.info("tools/call ok name=%s rid=%s", name, rid)
-            return success(res)
-
-        except ValueError as ve:
-            log.warning("tools/call invalid_params name=%s rid=%s error=%s", name, rid, ve)
-            return error(-32602, f"Invalid params: {ve}")
-
-        except Exception as e:
-            log.exception("tools/call failed name=%s rid=%s", name, rid)
-            try:
-                data = json.loads(str(e))
-            except Exception:
-                data = {"detail": str(e)}
-            log.info("tools/call error_data name=%s rid=%s data=%s", name, rid, data)
-            if is_notification:
-                return None
-            return {"jsonrpc": "2.0", "id": _id, "error": mcp_err("Google Ads API error", data)}
-
-    # Fallback for any other method not handled above
-    return error(-32601, f"Method not found: {method}")
 
 # ---------- JSON-RPC ----------
 @app.post("/")
