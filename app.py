@@ -84,7 +84,8 @@ app.add_middleware(
 
 class MCPProtocolHeader(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        request_default = request.headers.get("MCP-Protocol-Version") or _latest_supported_protocol()
+        req_hdr = request.headers.get("MCP-Protocol-Version") or request.headers.get("Mcp-Protocol-Version")
+        request_default = req_hdr or _latest_supported_protocol()
         response = await call_next(request)
         negotiated = getattr(request.state, "mcp_protocol_version", None)
         final_proto = negotiated or response.headers.get("MCP-Protocol-Version") or request_default
@@ -1028,7 +1029,10 @@ def tool_resolve_customer(args: Dict[str, Any]) -> Dict[str, Any]:
 async def root_get(request: Request):
     if request.method == "HEAD":
         return PlainTextResponse("")
-    return PlainTextResponse("ok")
+    return JSONResponse({
+        "ok": True,
+        "message": "MCP server. POST / for JSON-RPC; see /.well-known/mcp.json and /mcp/*"
+    })
 
 # Quiet favicon noise in logs (optional but nice)
 @app.get("/favicon.ico", include_in_schema=False)
