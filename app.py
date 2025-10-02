@@ -344,7 +344,7 @@ TOOLS = [
                 "min_spend": {
                     "type": "number",
                     "description": "Minimum spend (account currency) required in the selected time range. Rows below this are filtered out.",
-                    "minimum": 0,
+                    "minimum": 1,
                     "default": 1.0
                 },
                 "page_size":  {
@@ -379,7 +379,7 @@ TOOLS = [
                 "min_spend": {
                     "type": "number",
                     "description": "Minimum spend (account currency) required in the selected time range. Campaigns below this are filtered out.",
-                    "minimum": 0,
+                    "minimum": 1,
                     "default": 1.0
                 },
                 "login_customer_id": {"type": "string", "maxLength": 20, "pattern": "^[0-9-]*$"}
