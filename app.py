@@ -1277,17 +1277,17 @@ async def rpc(request: Request):
             for entry in payload:
                 resp = _handle_single_rpc(entry, request, headers, status, public_tools)
                 _sync_protocol_header()
-                if resp is None:
-                    continue
-                responses.append(resp)
+                if resp is not None:
+                    responses.append(resp)
 
             rid = getattr(request.state, "request_id", "-")
             log.info("resp headers: %s rid=%s", headers, rid)
 
             if responses:
-                return JSONResponse(responses, status_code=status["code"], headers=headers)
-            status_code = status["code"] if status["code"] != 200 else 204
-            return Response(status_code=status_code, headers=headers)
+                return JSONResponse(responses, status_code=200, headers=headers)
+            # All were notifications → 204 No Content (never flip to 401/424)
+            return Response(status_code=204, headers=headers)
+
 
         resp = _handle_single_rpc(payload, request, headers, status, public_tools)
         _sync_protocol_header()
