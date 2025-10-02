@@ -25,12 +25,23 @@ from google.ads.googleads.errors import GoogleAdsException
 APP_NAME = "mcp-google-ads"
 APP_VER  = "0.1.0"
 MCP_PROTO_DEFAULT = "2024-11-05"
-SUPPORTED_MCP_VERSIONS: List[str] = sorted({MCP_PROTO_DEFAULT})
-
+SUPPORTED_MCP_VERSIONS: List[str] = ["2024-11-05"]
 
 def _latest_supported_protocol() -> str:
-    """Return the newest protocol revision this server supports."""
     return SUPPORTED_MCP_VERSIONS[-1]
+
+def _validate_protocol_version_string(version: str) -> str:
+    datetime.date.fromisoformat(version)  # raises if bad
+    return version
+
+def _negotiate_protocol_version(requested: Optional[str]) -> Optional[str]:
+    if requested is None:
+        return _latest_supported_protocol()
+    # pick the newest supported <= requested
+    for v in sorted(SUPPORTED_MCP_VERSIONS, reverse=True):
+        if v <= requested:
+            return v
+    return None
 
 # ---------- Logging & shared-secret ----------
 logging.basicConfig(level=logging.INFO)
@@ -140,14 +151,8 @@ app.add_middleware(RPCAudit)
 # 4) MCP protocol header (innermost; finalizes header based on negotiation)
 class MCPProtocolHeader(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        requested = (
-            request.headers.get("MCP-Protocol-Version")
-            or request.headers.get("Mcp-Protocol-Version")
-            or _latest_supported_protocol()
-        )
         response = await call_next(request)
-        negotiated = getattr(request.state, "mcp_protocol_version", None)
-        final_proto = negotiated or response.headers.get("MCP-Protocol-Version") or requested
+        final_proto = getattr(request.state, "mcp_protocol_version", None) or _latest_supported_protocol()
         response.headers["MCP-Protocol-Version"] = final_proto
         return response
 
@@ -1173,22 +1178,40 @@ def _handle_single_rpc(
 
     # ---------------- initialize ----------------
     if method == "initialize":
-        client_proto = (
-            (payload.get("params") or {}).get("protocolVersion")
-            or request.headers.get("MCP-Protocol-Version")
-            or request.headers.get("Mcp-Protocol-Version")
-            or _latest_supported_protocol()
-        )
-        request.state.mcp_protocol_version = client_proto
-        authed = _is_authed(request)
-        visible_tools = [t for t in TOOLS if authed or t.get("name") in PUBLIC_TOOLS]
-        result = {
-            "protocolVersion": client_proto,
-            "capabilities": {"tools": {"listChanged": True}},
-            "serverInfo": {"name": APP_NAME, "version": APP_VER},
-            "tools": visible_tools,
-        }
-        return success(result)
+    raw_proto = (
+        (payload.get("params") or {}).get("protocolVersion")
+        or request.headers.get("MCP-Protocol-Version")
+        or request.headers.get("Mcp-Protocol-Version")
+        or None
+    )
+
+    requested: Optional[str]
+    try:
+        requested = _validate_protocol_version_string(raw_proto) if raw_proto else None
+    except ValueError:
+        latest = _latest_supported_protocol()
+        headers["MCP-Protocol-Version"] = latest
+        request.state.mcp_protocol_version = latest
+        return error(-32602, "Invalid protocolVersion format", {"supportedVersions": SUPPORTED_MCP_VERSIONS})
+
+    negotiated = _negotiate_protocol_version(requested)
+    if negotiated is None:
+        latest = _latest_supported_protocol()
+        headers["MCP-Protocol-Version"] = latest
+        request.state.mcp_protocol_version = latest
+        return error(-32602, "Unsupported protocolVersion", {"supportedVersions": SUPPORTED_MCP_VERSIONS})
+
+    headers["MCP-Protocol-Version"] = negotiated
+    request.state.mcp_protocol_version = negotiated
+
+    authed = _is_authed(request)
+    visible_tools = [t for t in TOOLS if authed or t.get("name") in PUBLIC_TOOLS]
+    return success({
+        "protocolVersion": negotiated,
+        "capabilities": {"tools": {"listChanged": True}},
+        "serverInfo": {"name": APP_NAME, "version": APP_VER},
+        "tools": visible_tools,
+    })
 
     # ---------------- initialized ack ----------------
     if method in ("initialized", "notifications/initialized"):
