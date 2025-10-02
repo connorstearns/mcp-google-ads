@@ -86,33 +86,34 @@ app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=False,
+    allow_credentials=False,  # must be False when allow_origins=["*"]
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
     expose_headers=["MCP-Protocol-Version", "Mcp-Session-Id", "X-Request-ID"],
 )
 
-# 2) Request ID (so downstream middlewares & handlers can use rid)
+# 2) Request ID (make a request-scoped id available to everything)
 class RequestId(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         rid = request.headers.get("X-Request-ID") or uuid.uuid4().hex[:12]
         request.state.request_id = rid
         response = await call_next(request)
+        # Echo so Cloud Run / clients can correlate
         response.headers["X-Request-ID"] = rid
         return response
 
 app.add_middleware(RequestId)
 
-# 3) RPC audit logging (uses rid)
+# 3) RPC audit logging (reads body once, reinjects it; logs UA and auth headers presence)
 class RPCAudit(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         if request.url.path == "/" and request.method == "POST":
             body_bytes = await request.body()  # read once
 
-            # Re-inject the body for downstream handlers
+            # Re-inject the body for downstream handlers (Starlette-safe)
             async def receive() -> Message:
                 return {"type": "http.request", "body": body_bytes, "more_body": False}
-            request._receive = receive  # Starlette-safe
+            request._receive = receive  # type: ignore[attr-defined]
 
             method = "unknown"
             try:
@@ -136,7 +137,7 @@ class RPCAudit(BaseHTTPMiddleware):
 
 app.add_middleware(RPCAudit)
 
-# 4) MCP protocol header (innermost so it can finalize the header)
+# 4) MCP protocol header (innermost; finalizes header based on negotiation)
 class MCPProtocolHeader(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         requested = (
@@ -152,31 +153,27 @@ class MCPProtocolHeader(BaseHTTPMiddleware):
 
 app.add_middleware(MCPProtocolHeader)
 
-# ---------- MCP tooling ----------
+# ---------- MCP tooling helpers ----------
 def mcp_ok_json(_title: str, data: Any) -> Dict[str, Any]:
-    # Return exactly one content item (json) to keep clients happy
+    """Return exactly one JSON content item (strict MCP clients prefer this)."""
     return {"content": [{"type": "json", "json": data}]}
 
-def mcp_ok_text(text: str) -> Dict[str, Any]:
-    return {"content": [{"type": "text", "text": text}]}
-
 def mcp_err(message: str, data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Standardized JSON-RPC tool error payload."""
     return {"code": -32000, "message": message, "data": data or {}}
 
 def _validate_protocol_version_string(version: str) -> str:
     """Ensure the protocol version is ISO formatted (YYYY-MM-DD)."""
     try:
         datetime.date.fromisoformat(version)
-    except Exception as exc:  # noqa: BLE001 - propagate as ValueError
+    except Exception as exc:
         raise ValueError("Invalid protocol version format") from exc
     return version
-
 
 def _negotiate_protocol_version(requested: Optional[str]) -> Optional[str]:
     """Pick the newest supported version that does not exceed the request."""
     if requested is None:
         return _latest_supported_protocol()
-
     for version in reversed(SUPPORTED_MCP_VERSIONS):
         if version <= requested:
             return version
