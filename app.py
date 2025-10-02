@@ -1216,7 +1216,7 @@ def _handle_single_rpc(
 
             func, title = handler
             data = func(args)
-            res  = mcp_ok_json(title, data)
+            res = mcp_ok_json(title, data)
 
             log.info("tools/call ok name=%s rid=%s", name, rid)
             return success(res)
@@ -1235,6 +1235,9 @@ def _handle_single_rpc(
             if is_notification:
                 return None
             return {"jsonrpc": "2.0", "id": _id, "error": mcp_err("Google Ads API error", data)}
+
+    # Fallback for any other method not handled above
+    return error(-32601, f"Method not found: {method}")
 
 # ---------- JSON-RPC ----------
 @app.post("/")
