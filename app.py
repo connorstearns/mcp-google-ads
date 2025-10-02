@@ -36,7 +36,7 @@ def _latest_supported_protocol() -> str:
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(APP_NAME)
 MCP_SHARED_KEY = os.getenv("MCP_SHARED_KEY", "").strip()
-log.info("MCP_SHARED_KEY enabled? %s", "YES" if MCP_SHARED_KEY else "NO")
+require_key = bool(MCP_SHARED_KEY)  # stays False if the var is empty
 
 # ---------- Env & Ads client factory ----------
 DEV_TOKEN         = os.getenv("GOOGLE_ADS_DEVELOPER_TOKEN", "")
@@ -637,8 +637,15 @@ TOOLS.append({
     "inputSchema": {"type": "object", "additionalProperties": False, "properties": {}}
 })
 
-# Public tools visible without auth (everything else is gated)
-PUBLIC_TOOLS: Set[str] = {"ping", "noop_ok"}
+# Public tools visible without auth (TEMP: expose everything while testing)
+PUBLIC_TOOLS: Set[str] = {
+    "ping", "noop_ok", "debug_login_header", "echo_short",
+    "list_resources", "resolve_customer",
+    "fetch_account_tree", "fetch_metrics", "fetch_campaign_summary",
+    "list_recommendations", "fetch_search_terms", "fetch_change_history",
+    "fetch_budget_pacing",
+}
+
 
 # ---------- Tool implementations ----------
 def tool_ping(_args: Dict[str, Any]) -> Dict[str, Any]:
