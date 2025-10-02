@@ -1131,27 +1131,32 @@ def _handle_single_rpc(
 
     require_key = bool(MCP_SHARED_KEY)
 
-    # ---- Auth gate for non-public tools ----
-    if require_key and method == "tools/call":
-        params = (payload.get("params") or {})
-        tool_name = (params.get("name") or "").lower()
-        if tool_name not in public_tools:
-            auth_hdr = request.headers.get("Authorization", "")
-            has_bearer = auth_hdr.lower().startswith("bearer ")
-            bearer_ok = has_bearer and auth_hdr.split(" ", 1)[1].strip() == MCP_SHARED_KEY
-            has_xhdr = "X-MCP-Key" in request.headers
-            xhdr_ok = request.headers.get("X-MCP-Key", "") == MCP_SHARED_KEY
+# ---- Auth gate for non-public tools ----
+if require_key and method == "tools/call":
+    params = (payload.get("params") or {})
+    tool_name = (params.get("name") or "").lower()
+    if tool_name not in public_tools:
+        auth_hdr = request.headers.get("Authorization", "")
+        has_bearer = auth_hdr.lower().startswith("bearer ")
+        bearer_ok = has_bearer and auth_hdr.split(" ", 1)[1].strip() == MCP_SHARED_KEY
+        has_xhdr = "X-MCP-Key" in request.headers
+        xhdr_ok = request.headers.get("X-MCP-Key", "") == MCP_SHARED_KEY
 
-            if not (bearer_ok or xhdr_ok):
-                log.warning(
-                    "401 on tools/call tool=%s has_bearer=%s has_xmcp=%s rid=%s",
-                    tool_name, has_bearer, has_xhdr, rid
-                )
-                status["code"] = 401
-                headers["WWW-Authenticate"] = 'Bearer realm="mcp-google-ads"'
-                if is_notification:
-                    return None
-                return _build_jsonrpc_error(_id, -32001, "Unauthorized")
+        if not (bearer_ok or xhdr_ok):
+            log.warning(
+                "401 on tools/call tool=%s has_bearer=%s has_xmcp=%s rid=%s",
+                tool_name, has_bearer, has_xhdr, rid
+            )
+            # Don't change outer HTTP status; just set the header for visibility
+            headers["WWW-Authenticate"] = 'Bearer realm="mcp-google-ads"'
+
+            # For notifications: swallow (no response object)
+            if is_notification:
+                return None
+
+            # For normal calls: return a JSON-RPC error object
+            return _build_jsonrpc_error(_id, -32001, "Unauthorized")
+
 
     def success(result: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if is_notification:
