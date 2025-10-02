@@ -1113,6 +1113,7 @@ def _build_jsonrpc_error(_id: Any, code: int, message: str, data: Optional[Dict[
         body["error"]["data"] = data
     return body
 
+
 def _handle_single_rpc(
     obj: Any,
     request: Request,
@@ -1120,6 +1121,7 @@ def _handle_single_rpc(
     status: Dict[str, int],
     public_tools: Set[str],
 ) -> Optional[Dict[str, Any]]:
+    """Handle one JSON-RPC object and return a JSON-RPC response object, or None for notifications."""
     if not isinstance(obj, dict):
         return _build_jsonrpc_error(None, -32600, "Invalid Request")
 
@@ -1131,32 +1133,26 @@ def _handle_single_rpc(
 
     require_key = bool(MCP_SHARED_KEY)
 
-# ---- Auth gate for non-public tools ----
-if require_key and method == "tools/call":
-    params = (payload.get("params") or {})
-    tool_name = (params.get("name") or "").lower()
-    if tool_name not in public_tools:
-        auth_hdr = request.headers.get("Authorization", "")
-        has_bearer = auth_hdr.lower().startswith("bearer ")
-        bearer_ok = has_bearer and auth_hdr.split(" ", 1)[1].strip() == MCP_SHARED_KEY
-        has_xhdr = "X-MCP-Key" in request.headers
-        xhdr_ok = request.headers.get("X-MCP-Key", "") == MCP_SHARED_KEY
+    # ---- Auth gate for non-public tools (JSON-RPC error only; don't flip outer HTTP status) ----
+    if require_key and method == "tools/call":
+        params = (payload.get("params") or {})
+        tool_name = (params.get("name") or "").lower()
+        if tool_name not in public_tools:
+            auth_hdr = request.headers.get("Authorization", "")
+            has_bearer = auth_hdr.lower().startswith("bearer ")
+            bearer_ok = has_bearer and auth_hdr.split(" ", 1)[1].strip() == MCP_SHARED_KEY
+            has_xhdr = "X-MCP-Key" in request.headers
+            xhdr_ok = request.headers.get("X-MCP-Key", "") == MCP_SHARED_KEY
 
-        if not (bearer_ok or xhdr_ok):
-            log.warning(
-                "401 on tools/call tool=%s has_bearer=%s has_xmcp=%s rid=%s",
-                tool_name, has_bearer, has_xhdr, rid
-            )
-            # Don't change outer HTTP status; just set the header for visibility
-            headers["WWW-Authenticate"] = 'Bearer realm="mcp-google-ads"'
-
-            # For notifications: swallow (no response object)
-            if is_notification:
-                return None
-
-            # For normal calls: return a JSON-RPC error object
-            return _build_jsonrpc_error(_id, -32001, "Unauthorized")
-
+            if not (bearer_ok or xhdr_ok):
+                log.warning(
+                    "401 on tools/call tool=%s has_bearer=%s has_xmcp=%s rid=%s",
+                    tool_name, has_bearer, has_xhdr, rid
+                )
+                headers["WWW-Authenticate"] = 'Bearer realm="mcp-google-ads"'
+                if is_notification:
+                    return None
+                return _build_jsonrpc_error(_id, -32001, "Unauthorized")
 
     def success(result: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if is_notification:
@@ -1203,7 +1199,6 @@ if require_key and method == "tools/call":
         name = params.get("name")
         args = params.get("arguments") or {}
 
-        # Map tool name -> (callable, title)
         TOOL_IMPLS = {
             "fetch_account_tree":     (tool_fetch_account_tree,     "Account tree"),
             "fetch_metrics":          (tool_fetch_metrics,          "Metrics"),
@@ -1214,7 +1209,7 @@ if require_key and method == "tools/call":
             "fetch_budget_pacing":    (tool_fetch_budget_pacing,    "Budget pacing"),
             "list_resources":         (tool_list_resources,         "Resources"),
             "resolve_customer":       (tool_resolve_customer,       "Resolved customer"),
-            # debug/trivial
+            # debug
             "ping":                   (tool_ping,                   "pong"),
             "debug_login_header":     (tool_debug_login_header,     "Debug login header"),
             "echo_short":             (tool_echo_short,             "echo"),
@@ -1223,7 +1218,6 @@ if require_key and method == "tools/call":
 
         try:
             log.info("tools/call start name=%s rid=%s", name, rid)
-
             handler = TOOL_IMPLS.get(name)
             if not handler:
                 return error(-32601, f"Unknown tool: {name}")
@@ -1248,16 +1242,15 @@ if require_key and method == "tools/call":
             except Exception:
                 data = {"detail": str(e)}
             log.info("tools/call error_data name=%s rid=%s data=%s", name, rid, data)
-            if is_notification:
-                return None
             return {"jsonrpc": "2.0", "id": _id, "error": mcp_err("Google Ads API error", data)}
 
     # ---------------- fallback ----------------
     return error(-32601, f"Method not found: {method}")
 
-# ---------- JSON-RPC ----------
+
 @app.post("/")
 async def rpc(request: Request):
+    """JSON-RPC endpoint that supports single objects and batches."""
     proto_header = request.headers.get("MCP-Protocol-Version", MCP_PROTO_DEFAULT)
     headers: Dict[str, str] = {"MCP-Protocol-Version": proto_header}
     status = {"code": 200}
@@ -1272,6 +1265,8 @@ async def rpc(request: Request):
 
     try:
         payload = await request.json()
+
+        # Batch
         if isinstance(payload, list):
             responses: List[Dict[str, Any]] = []
             for entry in payload:
@@ -1285,10 +1280,10 @@ async def rpc(request: Request):
 
             if responses:
                 return JSONResponse(responses, status_code=200, headers=headers)
-            # All were notifications → 204 No Content (never flip to 401/424)
+            # All notifications → 204
             return Response(status_code=204, headers=headers)
 
-
+        # Single
         resp = _handle_single_rpc(payload, request, headers, status, public_tools)
         _sync_protocol_header()
 
@@ -1296,9 +1291,9 @@ async def rpc(request: Request):
         log.info("resp headers: %s rid=%s", headers, rid)
 
         if resp is not None:
-            return JSONResponse(resp, status_code=status["code"], headers=headers)
-        status_code = status["code"] if status["code"] != 200 else 204
-        return Response(status_code=status_code, headers=headers)
+            return JSONResponse(resp, status_code=200, headers=headers)
+        # Notification → 204
+        return Response(status_code=204, headers=headers)
 
     except Exception as e:
         log.exception("RPC dispatch error")
@@ -1309,7 +1304,6 @@ async def rpc(request: Request):
             {"jsonrpc": "2.0", "id": None, "error": {"code": -32098, "message": f"RPC dispatch error: {e}"}},
             headers=headers
         )
-
 
 # ---------- Local dev ----------
 if __name__ == "__main__":
