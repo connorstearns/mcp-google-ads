@@ -280,56 +280,274 @@ def tool_fetch_metrics(args: Dict[str, Any]) -> Dict[str, Any]:
         return {"error": {"detail": str(e)}}
 
 
-# -------------------- Tool registry --------------------
-TOOLS: List[Dict[str, Any]] = [
+# ---------- TOOLS (schemas updated with min_spend) ----------
+TOOLS = [
     {
-        "name": "ping",
-        "description": "Health check.",
-        "inputSchema": {"type": "object", "additionalProperties": False, "properties": {}},
-    },
-    {
-        "name": "list_resources",
-        "description": "List accessible Google Ads customer accounts.",
-        "inputSchema": {"type": "object", "additionalProperties": False, "properties": {}},
-    },
-    {
-        "name": "fetch_campaign_summary",
-        "description": "Per-campaign KPIs with simple ctr/cpc/cpa/roas.",
+        "name": "fetch_account_tree",
+        "description": "List accessible customer hierarchy (manager → clients).",
         "inputSchema": {
             "type": "object",
             "additionalProperties": False,
             "properties": {
-                "customer_id": {"type": "string"},
-                "login_customer_id": {"type": "string"},
-                "date_preset": {"type": "string"},
-                "time_range": {
-                    "type": "object",
-                    "properties": {"since": {"type": "string"}, "until": {"type": "string"}},
+                "root_customer_id": {
+                    "type": "string",
+                    "description": "Manager (MCC) customer id (digits or dashes)",
+                    "maxLength": 20,
+                    "pattern": "^[0-9-]+$"
                 },
+                "depth": {"type": "integer", "minimum": 1, "maximum": 10, "default": 2}
             },
-        },
+            "required": ["root_customer_id"]
+        }
     },
     {
         "name": "fetch_metrics",
-        "description": "Generic metrics for account/campaign/ad_group/ad.",
+        "description": "Generic metrics for account/campaign/ad_group/ad with optional segments. Supports min_spend to filter by spend in the date range.",
         "inputSchema": {
             "type": "object",
             "additionalProperties": False,
             "properties": {
-                "customer_id": {"type": "string"},
-                "entity": {"type": "string", "enum": ["account", "campaign", "ad_group", "ad"], "default": "campaign"},
-                "ids": {"type": "array", "items": {"type": "string"}},
-                "fields": {"type": "array", "items": {"type": "string"}},
-                "date_preset": {"type": "string"},
+                "customer_id":   {"type": "string", "description": "Digits only; or provide 'customer'/'customer_name'", "maxLength": 20, "pattern": "^[0-9-]*$"},
+                "customer":      {"type": "string", "description": "Client name or alias", "maxLength": 120},
+                "customer_name": {"type": "string", "description": "Client name (alternative)", "maxLength": 120},
+                "entity": {"type": "string", "enum": ["account","campaign","ad_group","ad"], "default": "campaign"},
+                "ids": {
+                    "type": "array",
+                    "description": "Filter to specific IDs for the chosen entity",
+                    "maxItems": 200,
+                    "items": {"type": "string", "maxLength": 30, "pattern": "^[0-9-]*$"}
+                },
+                "fields": {
+                    "type": "array",
+                    "maxItems": 100,
+                    "items": {"type": "string", "maxLength": 64},
+                    "default": ["metrics.cost_micros","metrics.clicks","metrics.impressions","metrics.conversions","metrics.conversions_value"]
+                },
+                "segments": {
+                    "type": "array",
+                    "description": "Optional segments: date, device, network, hour, day_of_week, quarter",
+                    "maxItems": 6,
+                    "items": {"type": "string", "enum": ["date","device","network","hour","day_of_week","quarter"]}
+                },
+                "date_preset": {
+                    "type": "string",
+                    "enum": ["TODAY","YESTERDAY","LAST_7_DAYS","LAST_30_DAYS","THIS_MONTH","LAST_MONTH"]
+                },
                 "time_range": {
                     "type": "object",
-                    "properties": {"since": {"type": "string"}, "until": {"type": "string"}},
+                    "additionalProperties": False,
+                    "properties": {
+                        "since": {"type": "string", "maxLength": 10, "pattern": "^\\d{4}-\\d{2}-\\d{2}$"},
+                        "until": {"type": "string", "maxLength": 10, "pattern": "^\\d{4}-\\d{2}-\\d{2}$"}
+                    }
                 },
-                "login_customer_id": {"type": "string"},
-            },
-        },
+                "min_spend": {
+                    "type": "number",
+                    "description": "Minimum spend (account currency) required in the selected time range. Rows below this are filtered out.",
+                    "minimum": 0,
+                    "default": 1.0
+                },
+                "page_size":  {
+                    "type": "integer",
+                    "description": "DEPRECATED/IGNORED: Google Ads search uses a fixed server page size.",
+                    "minimum": 1, "maximum": 10000, "default": 1000
+                },
+                "page_token": {"type": ["string","null"], "maxLength": 200},
+                "login_customer_id": {"type": "string", "description": "Manager id for header (optional)", "maxLength": 20, "pattern": "^[0-9-]*$"}
+            }
+        }
     },
+    {
+        "name": "fetch_campaign_summary",
+        "description": "Per-campaign KPIs with computed ctr/cpc/cpa/roas. Supports min_spend to filter by spend in the date range.",
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "customer_id":   {"type": "string", "maxLength": 20, "pattern": "^[0-9-]*$"},
+                "customer":      {"type": "string", "maxLength": 120},
+                "customer_name": {"type": "string", "maxLength": 120},
+                "date_preset":   {"type": "string", "enum": ["TODAY","YESTERDAY","LAST_7_DAYS","LAST_30_DAYS","THIS_MONTH","LAST_MONTH"]},
+                "time_range": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "since": {"type": "string", "maxLength": 10, "pattern": "^\\d{4}-\\d{2}-\\d{2}$"},
+                        "until": {"type": "string", "maxLength": 10, "pattern": "^\\d{4}-\\d{2}-\\d{2}$"}
+                    }
+                },
+                "min_spend": {
+                    "type": "number",
+                    "description": "Minimum spend (account currency) required in the selected time range. Campaigns below this are filtered out.",
+                    "minimum": 0,
+                    "default": 1.0
+                },
+                "login_customer_id": {"type": "string", "maxLength": 20, "pattern": "^[0-9-]*$"}
+            }
+        }
+    },
+    {
+        "name": "list_recommendations",
+        "description": "Google Ads Recommendations for a customer.",
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "customer_id":   {"type": "string", "maxLength": 20, "pattern": "^[0-9-]*$"},
+                "customer":      {"type": "string", "maxLength": 120},
+                "customer_name": {"type": "string", "maxLength": 120},
+                "types": {
+                    "type": "array",
+                    "description": "Optional filter by recommendation.type",
+                    "maxItems": 50,
+                    "items": {"type": "string", "maxLength": 64}
+                },
+                "login_customer_id": {"type": "string", "maxLength": 20, "pattern": "^[0-9-]*$"}
+            }
+        }
+    },
+    {
+        "name": "fetch_search_terms",
+        "description": "Search terms with basic filters.",
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "customer_id":   {"type": "string", "maxLength": 20, "pattern": "^[0-9-]*$"},
+                "customer":      {"type": "string", "maxLength": 120},
+                "customer_name": {"type": "string", "maxLength": 120},
+                "date_preset":   {"type": "string", "enum": ["TODAY","YESTERDAY","LAST_7_DAYS","LAST_30_DAYS","THIS_MONTH","LAST_MONTH"]},
+                "time_range": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "since": {"type": "string", "maxLength": 10, "pattern": "^\\d{4}-\\d{2}-\\d{2}$"},
+                        "until": {"type": "string", "maxLength": 10, "pattern": "^\\d{4}-\\d{2}-\\d{2}$"}
+                    }
+                },
+                "min_clicks": {"type": "integer", "minimum": 0, "default": 0},
+                "min_cost_micros": {"type": "integer", "minimum": 0, "default": 0},
+                "campaign_ids": {
+                    "type": "array",
+                    "maxItems": 200,
+                    "items": {"type": "string", "maxLength": 30, "pattern": "^[0-9-]*$"}
+                },
+                "ad_group_ids": {
+                    "type": "array",
+                    "maxItems": 200,
+                    "items": {"type": "string", "maxLength": 30, "pattern": "^[0-9-]*$"}
+                },
+                "login_customer_id": {"type": "string", "maxLength": 20, "pattern": "^[0-9-]*$"}
+            }
+        }
+    },
+    {
+        "name": "fetch_change_history",
+        "description": "Change events within a date range.",
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "customer_id":   {"type": "string", "maxLength": 20, "pattern": "^[0-9-]*$"},
+                "customer":      {"type": "string", "maxLength": 120},
+                "customer_name": {"type": "string", "maxLength": 120},
+                "time_range": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "since": {"type": "string", "maxLength": 19, "pattern": "^\\d{4}-\\d{2}-\\d{2}$"},
+                        "until": {"type": "string", "maxLength": 19, "pattern": "^\\d{4}-\\d{2}-\\d{2}$"}
+                    }
+                },
+                "resource_types": {
+                    "type": "array",
+                    "description": "Optional: filter by change_event.resource_type",
+                    "maxItems": 50,
+                    "items": {"type": "string", "maxLength": 64}
+                },
+                "login_customer_id": {"type": "string", "maxLength": 20, "pattern": "^[0-9-]*$"}
+            },
+            "required": ["time_range"]
+        }
+    },
+    {
+        "name": "fetch_budget_pacing",
+        "description": "Month-to-date spend and projected end-of-month vs target.",
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "customer_id":   {"type": "string", "maxLength": 20, "pattern": "^[0-9-]*$"},
+                "customer":      {"type": "string", "maxLength": 120},
+                "customer_name": {"type": "string", "maxLength": 120},
+                "month": {"type": "string", "description": "YYYY-MM", "maxLength": 7, "pattern": "^\\d{4}-\\d{2}$"},
+                "target_spend": {"type": "number", "description": "Target for the month in account currency"},
+                "login_customer_id": {"type": "string", "maxLength": 20, "pattern": "^[0-9-]*$"}
+            },
+            "required": ["month","target_spend"]
+        }
+    },
+    {
+        "name": "list_resources",
+        "description": "List accessible Google Ads customer accounts for the authenticated user.",
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "login_customer_id": {
+                    "type": "string",
+                    "description": "Optional manager (MCC) header override",
+                    "maxLength": 20,
+                    "pattern": "^[0-9-]*$"
+                }
+            }
+        }
+    },
+    {
+        "name": "resolve_customer",
+        "description": "Resolve a client name or alias (or raw ID) to a normalized customer_id.",
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "customer": {"type":"string", "description":"Client name, alias, or numeric ID", "maxLength": 120},
+                "login_customer_id": {"type":"string", "description":"MCC for hierarchy lookup (optional)", "maxLength": 20, "pattern": "^[0-9-]*$"}
+            },
+            "required": ["customer"]
+        }
+    }
 ]
+
+# Public/debug tools (unchanged)
+TOOLS.append({
+    "name": "ping",
+    "description": "Health check (public).",
+    "inputSchema": {"type": "object", "additionalProperties": False, "properties": {}}
+})
+TOOLS.append({
+    "name": "debug_login_header",
+    "description": "Show which login_customer_id (MCC) the server will use.",
+    "inputSchema": {"type": "object", "additionalProperties": False, "properties": {}}
+})
+TOOLS.append({
+    "name": "echo_short",
+    "description": "Echo a short string. Use only for debugging tool calls.",
+    "inputSchema": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {"msg": {"type": "string", "maxLength": 80}},
+        "required": ["msg"]
+    }
+})
+TOOLS.append({
+    "name": "noop_ok",
+    "description": "Returns a tiny fixed JSON object.",
+    "inputSchema": {"type": "object", "additionalProperties": False, "properties": {}}
+})
+
+# Public tools visible without auth (everything else is gated)
+PUBLIC_TOOLS: Set[str] = {"ping", "noop_ok"}
+
 
 
 # -------------------- Discovery (minimal) --------------------
