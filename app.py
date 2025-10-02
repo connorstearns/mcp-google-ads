@@ -1178,40 +1178,48 @@ def _handle_single_rpc(
 
     # ---------------- initialize ----------------
     if method == "initialize":
-    raw_proto = (
-        (payload.get("params") or {}).get("protocolVersion")
-        or request.headers.get("MCP-Protocol-Version")
-        or request.headers.get("Mcp-Protocol-Version")
-        or None
-    )
+        raw_proto = (
+            (payload.get("params") or {}).get("protocolVersion")
+            or request.headers.get("MCP-Protocol-Version")
+            or request.headers.get("Mcp-Protocol-Version")
+            or None
+        )
 
-    requested: Optional[str]
-    try:
-        requested = _validate_protocol_version_string(raw_proto) if raw_proto else None
-    except ValueError:
-        latest = _latest_supported_protocol()
-        headers["MCP-Protocol-Version"] = latest
-        request.state.mcp_protocol_version = latest
-        return error(-32602, "Invalid protocolVersion format", {"supportedVersions": SUPPORTED_MCP_VERSIONS})
+        # validate the incoming string if present
+        try:
+            requested = _validate_protocol_version_string(raw_proto) if raw_proto else None
+        except ValueError:
+            latest = _latest_supported_protocol()
+            headers["MCP-Protocol-Version"] = latest
+            request.state.mcp_protocol_version = latest
+            return error(-32602, "Invalid protocolVersion format", {"supportedVersions": SUPPORTED_MCP_VERSIONS})
 
-    negotiated = _negotiate_protocol_version(requested)
-    if negotiated is None:
-        latest = _latest_supported_protocol()
-        headers["MCP-Protocol-Version"] = latest
-        request.state.mcp_protocol_version = latest
-        return error(-32602, "Unsupported protocolVersion", {"supportedVersions": SUPPORTED_MCP_VERSIONS})
+        # negotiate down to a supported version
+        negotiated = _negotiate_protocol_version(requested)
+        if negotiated is None:
+            latest = _latest_supported_protocol()
+            headers["MCP-Protocol-Version"] = latest
+            request.state.mcp_protocol_version = latest
+            return error(-32602, "Unsupported protocolVersion", {"supportedVersions": SUPPORTED_MCP_VERSIONS})
 
-    headers["MCP-Protocol-Version"] = negotiated
-    request.state.mcp_protocol_version = negotiated
+        # pin response/header to negotiated version
+        headers["MCP-Protocol-Version"] = negotiated
+        request.state.mcp_protocol_version = negotiated
 
-    authed = _is_authed(request)
-    visible_tools = [t for t in TOOLS if authed or t.get("name") in PUBLIC_TOOLS]
-    return success({
-        "protocolVersion": negotiated,
-        "capabilities": {"tools": {"listChanged": True}},
-        "serverInfo": {"name": APP_NAME, "version": APP_VER},
-        "tools": visible_tools,
-    })
+        authed = _is_authed(request)
+        visible_tools = [t for t in TOOLS if authed or t.get("name") in PUBLIC_TOOLS]
+
+        log.info(
+            "protocol negotiated requested=%s -> %s rid=%s",
+            raw_proto, negotiated, getattr(request.state, "request_id", "-"),
+        )
+
+        return success({
+            "protocolVersion": negotiated,
+            "capabilities": {"tools": {"listChanged": True}},
+            "serverInfo": {"name": APP_NAME, "version": APP_VER},
+            "tools": visible_tools,
+        })
 
     # ---------------- initialized ack ----------------
     if method in ("initialized", "notifications/initialized"):
