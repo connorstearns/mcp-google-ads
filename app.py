@@ -1,12 +1,13 @@
 # app.py
 from __future__ import annotations
 
+import datetime
 import json
 import os
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, PlainTextResponse, Response
+from fastapi.responses import JSONResponse, PlainTextResponse
 
 # Google Ads
 from google.ads.googleads.client import GoogleAdsClient
@@ -15,7 +16,7 @@ from google.ads.googleads.errors import GoogleAdsException
 
 # -------------------- App & MCP basics --------------------
 APP_NAME = "mcp-google-ads"
-APP_VER = "0.2.0"
+APP_VER = "0.3.0"
 MCP_PROTO_DEFAULT = "2024-11-05"
 
 app = FastAPI()
@@ -59,14 +60,53 @@ def _money(micros: int | None) -> float:
     return round((micros or 0) / 1_000_000, 6)
 
 
+def _where_time(args: Dict[str, Any]) -> str:
+    """Return a GAQL WHERE date fragment from date_preset or time_range."""
+    date_preset = (args.get("date_preset") or "").upper().strip()
+    tr = args.get("time_range") or {}
+    if tr.get("since") and tr.get("until"):
+        return f" segments.date BETWEEN '{tr['since']}' AND '{tr['until']}' "
+    if date_preset in {"TODAY", "YESTERDAY", "LAST_7_DAYS", "LAST_30_DAYS", "THIS_MONTH", "LAST_MONTH"}:
+        return f" segments.date DURING {date_preset} "
+    return " segments.date DURING LAST_30_DAYS "
+
+
+def _err_from_gax(e: GoogleAdsException) -> Dict[str, Any]:
+    status = e.error.code().name if hasattr(e, "error") else "UNKNOWN"
+    rid = getattr(e, "request_id", None)
+    details: Dict[str, Any] = {"status": status, "request_id": rid}
+    try:
+        if getattr(e, "failure", None) and e.failure.errors:
+            details["errors"] = [{"message": er.message} for er in e.failure.errors]
+    except Exception:
+        pass
+    return details
+
+
 # -------------------- Minimal tools --------------------
 def tool_ping(_args: Dict[str, Any]) -> Dict[str, Any]:
     return {"ok": True}
 
 
-def tool_list_resources(_args: Dict[str, Any]) -> Dict[str, Any]:
+def tool_debug_login_header(_args: Dict[str, Any]) -> Dict[str, Any]:
+    return {"env_LOGIN_CUSTOMER_ID": LOGIN_CUSTOMER_ID}
+
+
+def tool_echo_short(args: Dict[str, Any]) -> Dict[str, Any]:
+    m = (args.get("msg") or "").strip()
+    if not m:
+        return {"error": {"detail": "msg required"}}
+    return {"msg": m}
+
+
+def tool_noop_ok(_args: Dict[str, Any]) -> Dict[str, Any]:
+    return {"ok": True}
+
+
+def tool_list_resources(args: Dict[str, Any]) -> Dict[str, Any]:
     try:
-        client = _new_ads_client()
+        login = (args.get("login_customer_id") or LOGIN_CUSTOMER_ID or "").replace("-", "") or None
+        client = _new_ads_client(login_cid=login)
         svc = client.get_service("CustomerService")
         resp = svc.list_accessible_customers()
         customers: List[Dict[str, str]] = []
@@ -74,40 +114,29 @@ def tool_list_resources(_args: Dict[str, Any]) -> Dict[str, Any]:
             customers.append({"resource_name": rn, "customer_id": rn.split("/")[-1]})
         return {"count": len(customers), "customers": customers}
     except GoogleAdsException as e:
-        status = e.error.code().name if hasattr(e, "error") else "UNKNOWN"
-        rid = getattr(e, "request_id", None)
-        details = {"status": status, "request_id": rid}
-        try:
-            if getattr(e, "failure", None) and e.failure.errors:
-                details["errors"] = [{"message": er.message} for er in e.failure.errors]
-        except Exception:
-            pass
-        return {"error": details}
+        return {"error": _err_from_gax(e)}
     except Exception as e:
         return {"error": {"detail": str(e)}}
 
 
+# -------------------- Campaign summary (with min_spend) --------------------
 def tool_fetch_campaign_summary(args: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Inputs (all optional, but customer_id strongly recommended):
+    Inputs (customer_id recommended):
       customer_id: "1234567890"
-      login_customer_id: MCC header override
+      login_customer_id: MCC header override (recommended for permissioned clients)
       date_preset: TODAY|YESTERDAY|LAST_7_DAYS|LAST_30_DAYS|THIS_MONTH|LAST_MONTH
       time_range: {"since":"YYYY-MM-DD","until":"YYYY-MM-DD"}  # overrides date_preset
+      min_spend: number >= 1.0 (account currency), default 1.0
     """
     login = (args.get("login_customer_id") or LOGIN_CUSTOMER_ID or "").replace("-", "") or None
     customer_id = (args.get("customer_id") or "").replace("-", "") or ""
     if not customer_id:
         return {"error": {"detail": "customer_id required"}}
 
-    date_preset = (args.get("date_preset") or "").upper().strip()
-    tr = args.get("time_range") or {}
-    if tr.get("since") and tr.get("until"):
-        where_time = f" segments.date BETWEEN '{tr['since']}' AND '{tr['until']}' "
-    elif date_preset in {"TODAY", "YESTERDAY", "LAST_7_DAYS", "LAST_30_DAYS", "THIS_MONTH", "LAST_MONTH"}:
-        where_time = f" segments.date DURING {date_preset} "
-    else:
-        where_time = " segments.date DURING LAST_30_DAYS "
+    where_time = _where_time(args)
+    min_spend = max(1.0, float(args.get("min_spend", 1.0)))
+    min_cost_micros = int(min_spend * 1_000_000)
 
     q = f"""
     SELECT
@@ -116,6 +145,8 @@ def tool_fetch_campaign_summary(args: Dict[str, Any]) -> Dict[str, Any]:
       metrics.conversions, metrics.conversions_value
     FROM campaign
     WHERE {where_time}
+      AND metrics.cost_micros >= {min_cost_micros}
+    ORDER BY metrics.cost_micros DESC
     """
 
     try:
@@ -150,26 +181,18 @@ def tool_fetch_campaign_summary(args: Dict[str, Any]) -> Dict[str, Any]:
             })
         return {"query": q, "rows": out}
     except GoogleAdsException as e:
-        status = e.error.code().name if hasattr(e, "error") else "UNKNOWN"
-        rid = getattr(e, "request_id", None)
-        details = {"status": status, "request_id": rid}
-        try:
-            if getattr(e, "failure", None) and e.failure.errors:
-                details["errors"] = [{"message": er.message} for er in e.failure.errors]
-        except Exception:
-            pass
-        return {"error": details}
+        return {"error": _err_from_gax(e)}
     except Exception as e:
         return {"error": {"detail": str(e)}}
 
 
+# -------------------- Generic metrics (with optional min_spend) --------------------
 ENTITY_FROM = {
     "account": "customer",
     "campaign": "campaign",
     "ad_group": "ad_group",
     "ad": "ad_group_ad",
 }
-
 
 def tool_fetch_metrics(args: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -179,6 +202,7 @@ def tool_fetch_metrics(args: Dict[str, Any]) -> Dict[str, Any]:
       ids: ["123","456"] optional
       fields: GAQL fields list (default common set)
       date_preset OR time_range like above
+      min_spend: number >= 1.0 (optional; when provided filters by spend)
       login_customer_id optional
     """
     login = (args.get("login_customer_id") or LOGIN_CUSTOMER_ID or "").replace("-", "") or None
@@ -199,14 +223,7 @@ def tool_fetch_metrics(args: Dict[str, Any]) -> Dict[str, Any]:
     ]
     ids = [str(x).replace("-", "") for x in (args.get("ids") or [])]
 
-    date_preset = (args.get("date_preset") or "").upper().strip()
-    tr = args.get("time_range") or {}
-    if tr.get("since") and tr.get("until"):
-        where_time = f" segments.date BETWEEN '{tr['since']}' AND '{tr['until']}' "
-    elif date_preset in {"TODAY", "YESTERDAY", "LAST_7_DAYS", "LAST_30_DAYS", "THIS_MONTH", "LAST_MONTH"}:
-        where_time = f" segments.date DURING {date_preset} "
-    else:
-        where_time = " segments.date DURING LAST_30_DAYS "
+    where_time = _where_time(args)
 
     id_col = {
         "account": "customer.id",
@@ -215,6 +232,16 @@ def tool_fetch_metrics(args: Dict[str, Any]) -> Dict[str, Any]:
         "ad": "ad_group_ad.ad.id",
     }[entity]
     id_clause = f" AND {id_col} IN ({','.join(ids)}) " if ids else ""
+
+    # Optional spend filter
+    min_spend = args.get("min_spend", None)
+    spend_clause = ""
+    if min_spend is not None:
+        try:
+            ms = max(1.0, float(min_spend))
+            spend_clause = f" AND metrics.cost_micros >= {int(ms * 1_000_000)} "
+        except Exception:
+            pass  # ignore invalid and do not filter
 
     base_cols = {
         "account": ["customer.id", "customer.descriptive_name"],
@@ -225,7 +252,11 @@ def tool_fetch_metrics(args: Dict[str, Any]) -> Dict[str, Any]:
 
     select_cols = base_cols + fields
     frm = ENTITY_FROM[entity]
-    q = f"SELECT {', '.join(select_cols)} FROM {frm} WHERE {where_time}{id_clause}"
+    q = f"""
+    SELECT {', '.join(select_cols)}
+    FROM {frm}
+    WHERE {where_time}{id_clause}{spend_clause}
+    """
 
     try:
         client = _new_ads_client(login_cid=login)
@@ -267,96 +298,207 @@ def tool_fetch_metrics(args: Dict[str, Any]) -> Dict[str, Any]:
 
         return {"query": q, "rows": out}
     except GoogleAdsException as e:
-        status = e.error.code().name if hasattr(e, "error") else "UNKNOWN"
-        rid = getattr(e, "request_id", None)
-        details = {"status": status, "request_id": rid}
-        try:
-            if getattr(e, "failure", None) and e.failure.errors:
-                details["errors"] = [{"message": er.message} for er in e.failure.errors]
-        except Exception:
-            pass
-        return {"error": details}
+        return {"error": _err_from_gax(e)}
     except Exception as e:
         return {"error": {"detail": str(e)}}
 
 
-# ---------- TOOLS (schemas updated with min_spend) ----------
+# -------------------- Search terms (top spend) --------------------
+def tool_fetch_search_terms(args: Dict[str, Any]) -> Dict[str, Any]:
+    login = (args.get("login_customer_id") or LOGIN_CUSTOMER_ID or "").replace("-", "") or None
+    customer_id = (args.get("customer_id") or "").replace("-", "") or ""
+    if not customer_id:
+        return {"error": {"detail": "customer_id required"}}
+
+    where_time = _where_time(args)
+
+    min_spend = max(1.0, float(args.get("min_spend", 1.0)))
+    min_cost_micros = int(min_spend * 1_000_000)
+    min_clicks = int(args.get("min_clicks", 0))
+
+    cids = [c.replace("-", "") for c in (args.get("campaign_ids") or [])]
+    agids = [g.replace("-", "") for g in (args.get("ad_group_ids") or [])]
+
+    filters = [where_time, f" AND metrics.cost_micros >= {min_cost_micros} "]
+    if min_clicks > 0:
+        filters.append(f" AND metrics.clicks >= {min_clicks} ")
+    if cids:
+        filters.append(f" AND campaign.id IN ({','.join(cids)}) ")
+    if agids:
+        filters.append(f" AND ad_group.id IN ({','.join(agids)}) ")
+
+    limit = max(1, min(int(args.get("limit", 100)), 1000))
+
+    q = f"""
+    SELECT
+      search_term_view.search_term,
+      campaign.id, campaign.name,
+      ad_group.id, ad_group.name,
+      metrics.impressions,
+      metrics.clicks,
+      metrics.cost_micros,
+      metrics.conversions,
+      metrics.conversions_value
+    FROM search_term_view
+    WHERE {''.join(filters)}
+    ORDER BY metrics.cost_micros DESC
+    LIMIT {limit}
+    """
+
+    try:
+        client = _new_ads_client(login_cid=login)
+        svc = client.get_service("GoogleAdsService")
+        rows = svc.search(request={"customer_id": customer_id, "query": q})
+
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            out.append({
+                "search_term": r.search_term_view.search_term,
+                "campaign_id": str(r.campaign.id),
+                "campaign_name": r.campaign.name,
+                "ad_group_id": str(r.ad_group.id),
+                "ad_group_name": r.ad_group.name,
+                "impressions": int(r.metrics.impressions or 0),
+                "clicks": int(r.metrics.clicks or 0),
+                "cost": _money(r.metrics.cost_micros),
+                "conversions": float(r.metrics.conversions or 0.0),
+                "conv_value": float(r.metrics.conversions_value or 0.0),
+            })
+        return {"query": q, "rows": out}
+    except GoogleAdsException as e:
+        return {"error": _err_from_gax(e)}
+    except Exception as e:
+        return {"error": {"detail": str(e)}}
+
+
+# -------------------- Change history --------------------
+def tool_fetch_change_history(args: Dict[str, Any]) -> Dict[str, Any]:
+    login = (args.get("login_customer_id") or LOGIN_CUSTOMER_ID or "").replace("-", "") or None
+    customer_id = (args.get("customer_id") or "").replace("-", "") or ""
+    if not customer_id:
+        return {"error": {"detail": "customer_id required"}}
+
+    tr = args.get("time_range") or {}
+    since = tr.get("since")
+    until = tr.get("until")
+    if not (since and until):
+        return {"error": {"detail": "time_range.since and time_range.until are required"}}
+
+    limit = max(1, min(int(args.get("limit", 200)), 1000))
+
+    types = args.get("resource_types") or []
+    type_filter = ""
+    if types:
+        safe = ",".join([f"'{t}'" for t in types])
+        type_filter = f" AND change_event.resource_type IN ({safe}) "
+
+    q = f"""
+    SELECT
+      change_event.change_date_time,
+      change_event.resource_type,
+      change_event.client_type,
+      change_event.user_email,
+      change_event.change_resource_name
+    FROM change_event
+    WHERE change_event.change_date_time BETWEEN '{since} 00:00:00' AND '{until} 23:59:59'
+      {type_filter}
+    ORDER BY change_event.change_date_time DESC
+    LIMIT {limit}
+    """
+
+    try:
+        client = _new_ads_client(login_cid=login)
+        svc = client.get_service("GoogleAdsService")
+        rows = svc.search(request={"customer_id": customer_id, "query": q})
+
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            out.append({
+                "time": r.change_event.change_date_time,
+                "resource_type": r.change_event.resource_type.name,
+                "client_type": r.change_event.client_type.name,
+                "user": r.change_event.user_email,
+                "change_resource_name": r.change_event.change_resource_name,
+            })
+        return {"query": q, "changes": out}
+    except GoogleAdsException as e:
+        return {"error": _err_from_gax(e)}
+    except Exception as e:
+        return {"error": {"detail": str(e)}}
+
+
+# -------------------- Budget pacing --------------------
+def tool_fetch_budget_pacing(args: Dict[str, Any]) -> Dict[str, Any]:
+    login = (args.get("login_customer_id") or LOGIN_CUSTOMER_ID or "").replace("-", "") or None
+    customer_id = (args.get("customer_id") or "").replace("-", "") or ""
+    if not customer_id:
+        return {"error": {"detail": "customer_id required"}}
+
+    month = args.get("month")
+    target = args.get("target_spend")
+    if not (month and target is not None):
+        return {"error": {"detail": "month and target_spend are required"}}
+
+    target = float(target)
+    year, mon = map(int, month.split("-"))
+    start = datetime.date(year, mon, 1)
+    today = datetime.date.today()
+
+    if today.year == year and today.month == mon:
+        end = today
+        days_elapsed = (end - start).days + 1
+        next_month = (start.replace(day=28) + datetime.timedelta(days=4)).replace(day=1)
+        days_in_month = (next_month - start).days
+    else:
+        next_month = (start.replace(day=28) + datetime.timedelta(days=4)).replace(day=1)
+        end = next_month - datetime.timedelta(days=1)
+        days_in_month = (next_month - start).days
+        days_elapsed = days_in_month
+
+    q = f"""
+    SELECT
+      segments.date,
+      metrics.cost_micros
+    FROM customer
+    WHERE segments.date BETWEEN '{start:%Y-%m-%d}' AND '{end:%Y-%m-%d}'
+    """
+
+    try:
+        client = _new_ads_client(login_cid=login)
+        svc = client.get_service("GoogleAdsService")
+        rows = svc.search(request={"customer_id": customer_id, "query": q})
+
+        mtd_cost = 0.0
+        for r in rows:
+            mtd_cost += _money(r.metrics.cost_micros)
+
+        avg_per_day = (mtd_cost / days_elapsed) if days_elapsed else 0.0
+        projected_eom = round(avg_per_day * days_in_month, 2)
+
+        pace_status = "on_track"
+        if projected_eom > target * 1.05:
+            pace_status = "over"
+        elif projected_eom < target * 0.95:
+            pace_status = "under"
+
+        return {
+            "month": month,
+            "target": round(target, 2),
+            "mtd_spend": round(mtd_cost, 2),
+            "projected_eom": projected_eom,
+            "days_elapsed": days_elapsed,
+            "days_in_month": days_in_month,
+            "pace_status": pace_status,
+            "query": q
+        }
+    except GoogleAdsException as e:
+        return {"error": _err_from_gax(e)}
+    except Exception as e:
+        return {"error": {"detail": str(e)}}
+
+
+# ---------- TOOLS (schemas) ----------
 TOOLS = [
-    {
-        "name": "fetch_account_tree",
-        "description": "List accessible customer hierarchy (manager → clients).",
-        "inputSchema": {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "root_customer_id": {
-                    "type": "string",
-                    "description": "Manager (MCC) customer id (digits or dashes)",
-                    "maxLength": 20,
-                    "pattern": "^[0-9-]+$"
-                },
-                "depth": {"type": "integer", "minimum": 1, "maximum": 10, "default": 2}
-            },
-            "required": ["root_customer_id"]
-        }
-    },
-    {
-        "name": "fetch_metrics",
-        "description": "Generic metrics for account/campaign/ad_group/ad with optional segments. Supports min_spend to filter by spend in the date range.",
-        "inputSchema": {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "customer_id":   {"type": "string", "description": "Digits only; or provide 'customer'/'customer_name'", "maxLength": 20, "pattern": "^[0-9-]*$"},
-                "customer":      {"type": "string", "description": "Client name or alias", "maxLength": 120},
-                "customer_name": {"type": "string", "description": "Client name (alternative)", "maxLength": 120},
-                "entity": {"type": "string", "enum": ["account","campaign","ad_group","ad"], "default": "campaign"},
-                "ids": {
-                    "type": "array",
-                    "description": "Filter to specific IDs for the chosen entity",
-                    "maxItems": 200,
-                    "items": {"type": "string", "maxLength": 30, "pattern": "^[0-9-]*$"}
-                },
-                "fields": {
-                    "type": "array",
-                    "maxItems": 100,
-                    "items": {"type": "string", "maxLength": 64},
-                    "default": ["metrics.cost_micros","metrics.clicks","metrics.impressions","metrics.conversions","metrics.conversions_value"]
-                },
-                "segments": {
-                    "type": "array",
-                    "description": "Optional segments: date, device, network, hour, day_of_week, quarter",
-                    "maxItems": 6,
-                    "items": {"type": "string", "enum": ["date","device","network","hour","day_of_week","quarter"]}
-                },
-                "date_preset": {
-                    "type": "string",
-                    "enum": ["TODAY","YESTERDAY","LAST_7_DAYS","LAST_30_DAYS","THIS_MONTH","LAST_MONTH"]
-                },
-                "time_range": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "properties": {
-                        "since": {"type": "string", "maxLength": 10, "pattern": "^\\d{4}-\\d{2}-\\d{2}$"},
-                        "until": {"type": "string", "maxLength": 10, "pattern": "^\\d{4}-\\d{2}-\\d{2}$"}
-                    }
-                },
-                "min_spend": {
-                    "type": "number",
-                    "description": "Minimum spend (account currency) required in the selected time range. Rows below this are filtered out.",
-                    "minimum": 1,
-                    "default": 1.0
-                },
-                "page_size":  {
-                    "type": "integer",
-                    "description": "DEPRECATED/IGNORED: Google Ads search uses a fixed server page size.",
-                    "minimum": 1, "maximum": 10000, "default": 1000
-                },
-                "page_token": {"type": ["string","null"], "maxLength": 200},
-                "login_customer_id": {"type": "string", "description": "Manager id for header (optional)", "maxLength": 20, "pattern": "^[0-9-]*$"}
-            }
-        }
-    },
     {
         "name": "fetch_campaign_summary",
         "description": "Per-campaign KPIs with computed ctr/cpc/cpa/roas. Supports min_spend to filter by spend in the date range.",
@@ -365,8 +507,6 @@ TOOLS = [
             "additionalProperties": False,
             "properties": {
                 "customer_id":   {"type": "string", "maxLength": 20, "pattern": "^[0-9-]*$"},
-                "customer":      {"type": "string", "maxLength": 120},
-                "customer_name": {"type": "string", "maxLength": 120},
                 "date_preset":   {"type": "string", "enum": ["TODAY","YESTERDAY","LAST_7_DAYS","LAST_30_DAYS","THIS_MONTH","LAST_MONTH"]},
                 "time_range": {
                     "type": "object",
@@ -378,7 +518,7 @@ TOOLS = [
                 },
                 "min_spend": {
                     "type": "number",
-                    "description": "Minimum spend (account currency) required in the selected time range. Campaigns below this are filtered out.",
+                    "description": "Minimum spend (account currency) in the selected time range.",
                     "minimum": 1,
                     "default": 1.0
                 },
@@ -387,104 +527,99 @@ TOOLS = [
         }
     },
     {
-        "name": "list_recommendations",
-        "description": "Google Ads Recommendations for a customer.",
+        "name": "fetch_metrics",
+        "description": "Generic metrics for account/campaign/ad_group/ad. Optional min_spend filter.",
         "inputSchema": {
             "type": "object",
             "additionalProperties": False,
             "properties": {
                 "customer_id":   {"type": "string", "maxLength": 20, "pattern": "^[0-9-]*$"},
-                "customer":      {"type": "string", "maxLength": 120},
-                "customer_name": {"type": "string", "maxLength": 120},
-                "types": {
-                    "type": "array",
-                    "description": "Optional filter by recommendation.type",
-                    "maxItems": 50,
-                    "items": {"type": "string", "maxLength": 64}
+                "entity": {"type": "string", "enum": ["account","campaign","ad_group","ad"], "default": "campaign"},
+                "ids": {
+                    "type": "array", "maxItems": 200,
+                    "items": {"type": "string", "maxLength": 30, "pattern": "^[0-9-]*$"}
                 },
+                "fields": {
+                    "type": "array", "maxItems": 100,
+                    "items": {"type": "string", "maxLength": 64},
+                    "default": ["metrics.cost_micros","metrics.clicks","metrics.impressions","metrics.conversions","metrics.conversions_value"]
+                },
+                "date_preset": {"type": "string", "enum": ["TODAY","YESTERDAY","LAST_7_DAYS","LAST_30_DAYS","THIS_MONTH","LAST_MONTH"]},
+                "time_range": {
+                    "type": "object", "additionalProperties": False,
+                    "properties": {
+                        "since": {"type": "string", "maxLength": 10, "pattern": "^\\d{4}-\\d{2}-\\d{2}$"},
+                        "until": {"type": "string", "maxLength": 10, "pattern": "^\\d{4}-\\d{2}-\\d{2}$"}
+                    }
+                },
+                "min_spend": {"type": "number", "minimum": 1},
                 "login_customer_id": {"type": "string", "maxLength": 20, "pattern": "^[0-9-]*$"}
             }
         }
     },
     {
         "name": "fetch_search_terms",
-        "description": "Search terms with basic filters.",
+        "description": "Top search terms by spend (and optional filters).",
         "inputSchema": {
             "type": "object",
             "additionalProperties": False,
             "properties": {
-                "customer_id":   {"type": "string", "maxLength": 20, "pattern": "^[0-9-]*$"},
-                "customer":      {"type": "string", "maxLength": 120},
-                "customer_name": {"type": "string", "maxLength": 120},
-                "date_preset":   {"type": "string", "enum": ["TODAY","YESTERDAY","LAST_7_DAYS","LAST_30_DAYS","THIS_MONTH","LAST_MONTH"]},
+                "customer_id":   { "type": "string", "maxLength": 20, "pattern": "^[0-9-]*$" },
+                "date_preset":   { "type": "string", "enum": ["TODAY","YESTERDAY","LAST_7_DAYS","LAST_30_DAYS","THIS_MONTH","LAST_MONTH"] },
                 "time_range": {
-                    "type": "object",
-                    "additionalProperties": False,
+                    "type": "object", "additionalProperties": False,
                     "properties": {
-                        "since": {"type": "string", "maxLength": 10, "pattern": "^\\d{4}-\\d{2}-\\d{2}$"},
-                        "until": {"type": "string", "maxLength": 10, "pattern": "^\\d{4}-\\d{2}-\\d{2}$"}
+                        "since": { "type": "string", "maxLength": 10, "pattern": "^\\d{4}-\\d{2}-\\d{2}$" },
+                        "until": { "type": "string", "maxLength": 10, "pattern": "^\\d{4}-\\d{2}-\\d{2}$" }
                     }
                 },
-                "min_clicks": {"type": "integer", "minimum": 0, "default": 0},
-                "min_cost_micros": {"type": "integer", "minimum": 0, "default": 0},
-                "campaign_ids": {
-                    "type": "array",
-                    "maxItems": 200,
-                    "items": {"type": "string", "maxLength": 30, "pattern": "^[0-9-]*$"}
-                },
-                "ad_group_ids": {
-                    "type": "array",
-                    "maxItems": 200,
-                    "items": {"type": "string", "maxLength": 30, "pattern": "^[0-9-]*$"}
-                },
-                "login_customer_id": {"type": "string", "maxLength": 20, "pattern": "^[0-9-]*$"}
+                "min_spend":     { "type": "number", "minimum": 1, "default": 1.0 },
+                "min_clicks":    { "type": "integer", "minimum": 0, "default": 0 },
+                "campaign_ids":  { "type": "array", "maxItems": 200, "items": { "type": "string", "maxLength": 30, "pattern": "^[0-9-]*$" } },
+                "ad_group_ids":  { "type": "array", "maxItems": 200, "items": { "type": "string", "maxLength": 30, "pattern": "^[0-9-]*$" } },
+                "limit":         { "type": "integer", "minimum": 1, "maximum": 1000, "default": 100 },
+                "login_customer_id": { "type": "string", "maxLength": 20, "pattern": "^[0-9-]*$" }
             }
         }
     },
     {
         "name": "fetch_change_history",
-        "description": "Change events within a date range.",
+        "description": "Change events within a date range (ordered by most recent).",
         "inputSchema": {
             "type": "object",
             "additionalProperties": False,
             "properties": {
-                "customer_id":   {"type": "string", "maxLength": 20, "pattern": "^[0-9-]*$"},
-                "customer":      {"type": "string", "maxLength": 120},
-                "customer_name": {"type": "string", "maxLength": 120},
+                "customer_id":   { "type": "string", "maxLength": 20, "pattern": "^[0-9-]*$" },
                 "time_range": {
-                    "type": "object",
-                    "additionalProperties": False,
+                    "type": "object", "additionalProperties": False,
                     "properties": {
-                        "since": {"type": "string", "maxLength": 19, "pattern": "^\\d{4}-\\d{2}-\\d{2}$"},
-                        "until": {"type": "string", "maxLength": 19, "pattern": "^\\d{4}-\\d{2}-\\d{2}$"}
+                        "since": { "type": "string", "maxLength": 10, "pattern": "^\\d{4}-\\d{2}-\\d{2}$" },
+                        "until": { "type": "string", "maxLength": 10, "pattern": "^\\d{4}-\\d{2}-\\d{2}$" }
                     }
                 },
                 "resource_types": {
-                    "type": "array",
-                    "description": "Optional: filter by change_event.resource_type",
-                    "maxItems": 50,
-                    "items": {"type": "string", "maxLength": 64}
+                    "type": "array", "maxItems": 50,
+                    "items": { "type": "string", "maxLength": 64 }
                 },
-                "login_customer_id": {"type": "string", "maxLength": 20, "pattern": "^[0-9-]*$"}
+                "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 200 },
+                "login_customer_id": { "type": "string", "maxLength": 20, "pattern": "^[0-9-]*$" }
             },
             "required": ["time_range"]
         }
     },
     {
         "name": "fetch_budget_pacing",
-        "description": "Month-to-date spend and projected end-of-month vs target.",
+        "description": "Month-to-date spend and projected EOM vs target.",
         "inputSchema": {
             "type": "object",
             "additionalProperties": False,
             "properties": {
-                "customer_id":   {"type": "string", "maxLength": 20, "pattern": "^[0-9-]*$"},
-                "customer":      {"type": "string", "maxLength": 120},
-                "customer_name": {"type": "string", "maxLength": 120},
-                "month": {"type": "string", "description": "YYYY-MM", "maxLength": 7, "pattern": "^\\d{4}-\\d{2}$"},
-                "target_spend": {"type": "number", "description": "Target for the month in account currency"},
-                "login_customer_id": {"type": "string", "maxLength": 20, "pattern": "^[0-9-]*$"}
+                "customer_id":   { "type": "string", "maxLength": 20, "pattern": "^[0-9-]*$" },
+                "month": { "type": "string", "description": "YYYY-MM", "maxLength": 7, "pattern": "^\\d{4}-\\d{2}$" },
+                "target_spend": { "type": "number", "description": "Target for the month in account currency" },
+                "login_customer_id": { "type": "string", "maxLength": 20, "pattern": "^[0-9-]*$" }
             },
-            "required": ["month","target_spend"]
+            "required": ["month", "target_spend"]
         }
     },
     {
@@ -504,50 +639,31 @@ TOOLS = [
         }
     },
     {
-        "name": "resolve_customer",
-        "description": "Resolve a client name or alias (or raw ID) to a normalized customer_id.",
+        "name": "ping",
+        "description": "Health check (public).",
+        "inputSchema": {"type": "object", "additionalProperties": False, "properties": {}}
+    },
+    {
+        "name": "debug_login_header",
+        "description": "Show which login_customer_id (MCC) the server will use.",
+        "inputSchema": {"type": "object", "additionalProperties": False, "properties": {}}
+    },
+    {
+        "name": "echo_short",
+        "description": "Echo a short string. Use only for debugging tool calls.",
         "inputSchema": {
             "type": "object",
             "additionalProperties": False,
-            "properties": {
-                "customer": {"type":"string", "description":"Client name, alias, or numeric ID", "maxLength": 120},
-                "login_customer_id": {"type":"string", "description":"MCC for hierarchy lookup (optional)", "maxLength": 20, "pattern": "^[0-9-]*$"}
-            },
-            "required": ["customer"]
+            "properties": {"msg": {"type": "string", "maxLength": 80}},
+            "required": ["msg"]
         }
+    },
+    {
+        "name": "noop_ok",
+        "description": "Returns a tiny fixed JSON object.",
+        "inputSchema": {"type": "object", "additionalProperties": False, "properties": {}}
     }
 ]
-
-# Public/debug tools (unchanged)
-TOOLS.append({
-    "name": "ping",
-    "description": "Health check (public).",
-    "inputSchema": {"type": "object", "additionalProperties": False, "properties": {}}
-})
-TOOLS.append({
-    "name": "debug_login_header",
-    "description": "Show which login_customer_id (MCC) the server will use.",
-    "inputSchema": {"type": "object", "additionalProperties": False, "properties": {}}
-})
-TOOLS.append({
-    "name": "echo_short",
-    "description": "Echo a short string. Use only for debugging tool calls.",
-    "inputSchema": {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {"msg": {"type": "string", "maxLength": 80}},
-        "required": ["msg"]
-    }
-})
-TOOLS.append({
-    "name": "noop_ok",
-    "description": "Returns a tiny fixed JSON object.",
-    "inputSchema": {"type": "object", "additionalProperties": False, "properties": {}}
-})
-
-# Public tools visible without auth (everything else is gated)
-PUBLIC_TOOLS: Set[str] = {"ping", "noop_ok"}
-
 
 
 # -------------------- Discovery (minimal) --------------------
@@ -585,12 +701,24 @@ def _pack_text(data: Any) -> Dict[str, Any]:
 def _call_tool(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
     if name == "ping":
         return _pack_text(tool_ping(args))
+    if name == "debug_login_header":
+        return _pack_text(tool_debug_login_header(args))
+    if name == "echo_short":
+        return _pack_text(tool_echo_short(args))
+    if name == "noop_ok":
+        return _pack_text(tool_noop_ok(args))
     if name == "list_resources":
         return _pack_text(tool_list_resources(args))
     if name == "fetch_campaign_summary":
         return _pack_text(tool_fetch_campaign_summary(args))
     if name == "fetch_metrics":
         return _pack_text(tool_fetch_metrics(args))
+    if name == "fetch_search_terms":
+        return _pack_text(tool_fetch_search_terms(args))
+    if name == "fetch_change_history":
+        return _pack_text(tool_fetch_change_history(args))
+    if name == "fetch_budget_pacing":
+        return _pack_text(tool_fetch_budget_pacing(args))
     return {"error": {"code": -32601, "message": f"Unknown tool: {name}"}}
 
 
