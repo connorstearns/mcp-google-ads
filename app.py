@@ -496,6 +496,122 @@ def tool_fetch_budget_pacing(args: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as e:
         return {"error": {"detail": str(e)}}
 
+# -------------------- Geo performance --------------------
+def tool_fetch_geo_performance(args: Dict[str, Any]) -> Dict[str, Any]:
+    login = (args.get("login_customer_id") or LOGIN_CUSTOMER_ID or "").replace("-", "") or None
+    customer_id = (args.get("customer_id") or "").replace("-", "") or ""
+    if not customer_id:
+        return {"error": {"detail": "customer_id required"}}
+
+    level = (args.get("level") or "city").lower().strip()
+    level_map = {
+        "city": ("geo_target_city", "city"),
+        "region": ("geo_target_region", "region"),
+        "country": ("geo_target_country", "country"),
+    }
+    if level not in level_map:
+        return {"error": {"detail": f"invalid level '{level}' (use city|region|country)"}}
+    geo_attr, geo_key = level_map[level]
+
+    view = (args.get("view") or "geographic").lower().strip()
+    if view not in {"geographic", "user_location"}:
+        return {"error": {"detail": f"invalid view '{view}' (use geographic|user_location)"}}
+    from_view = "geographic_view" if view == "geographic" else "user_location_view"
+
+    where_time = _where_time(args)
+
+    cids = [str(c).replace("-", "").strip() for c in (args.get("campaign_ids") or []) if str(c).strip()]
+    cid_clause = f" AND campaign.id IN ({','.join(cids)}) " if cids else ""
+
+    # Optional spend filter (>= 0 allowed to surface zeros if the caller wants it)
+    spend_clause = ""
+    if args.get("min_spend") is not None:
+        try:
+            ms = max(0.0, float(args.get("min_spend", 0.0)))
+            spend_clause = f" AND metrics.cost_micros >= {int(ms * 1_000_000)} "
+        except Exception:
+            pass
+
+    select_cols = [
+        "campaign.id",
+        "campaign.name",
+        f"segments.{geo_attr}",
+        "metrics.impressions",
+        "metrics.clicks",
+        "metrics.cost_micros",
+        "metrics.conversions",
+        "metrics.conversions_value",
+    ]
+
+    q = f"""
+    SELECT
+      {', '.join(select_cols)}
+    FROM {from_view}
+    WHERE {where_time}{cid_clause}{spend_clause}
+    ORDER BY metrics.cost_micros DESC
+    """
+
+    try:
+        client = _new_ads_client(login_cid=login)
+        svc = client.get_service("GoogleAdsService")
+        rows = svc.search(request={"customer_id": customer_id, "query": q})
+
+        out: List[Dict[str, Any]] = []
+        totals_by_campaign: Dict[str, Dict[str, float]] = {}
+
+        for r in rows:
+            cost = _money(getattr(r.metrics, "cost_micros", 0))
+            imps = int(getattr(r.metrics, "impressions", 0) or 0)
+            clicks = int(getattr(r.metrics, "clicks", 0) or 0)
+            conv = float(getattr(r.metrics, "conversions", 0.0) or 0.0)
+            conv_val = float(getattr(r.metrics, "conversions_value", 0.0) or 0.0)
+
+            # Geo label from segments
+            geo_label = getattr(r.segments, geo_attr, None)
+            # Some client versions return None or empty; normalize to ""
+            geo_label = str(geo_label) if geo_label is not None else ""
+
+            row = {
+                "campaign_id": str(r.campaign.id),
+                "campaign_name": r.campaign.name,
+                geo_key: geo_label,
+                "impressions": imps,
+                "clicks": clicks,
+                "cost": round(cost, 2),
+                "conversions": round(conv, 2),
+                "conv_value": round(conv_val, 2),
+            }
+            out.append(row)
+
+            # Totals per campaign (handy for QA)
+            key = str(r.campaign.id)
+            if key not in totals_by_campaign:
+                totals_by_campaign[key] = {"cost": 0.0, "clicks": 0.0, "impressions": 0.0, "conversions": 0.0, "conv_value": 0.0}
+            totals_by_campaign[key]["cost"] += cost
+            totals_by_campaign[key]["clicks"] += clicks
+            totals_by_campaign[key]["impressions"] += imps
+            totals_by_campaign[key]["conversions"] += conv
+            totals_by_campaign[key]["conv_value"] += conv_val
+
+        # Round totals for readability
+        totals = {
+            cid: {
+                "cost": round(v["cost"], 2),
+                "clicks": int(v["clicks"]),
+                "impressions": int(v["impressions"]),
+                "conversions": round(v["conversions"], 2),
+                "conv_value": round(v["conv_value"], 2),
+            }
+            for cid, v in totals_by_campaign.items()
+        }
+
+        return {"query": q, "view": from_view, "level": level, "rows": out, "totals_by_campaign": totals}
+    except GoogleAdsException as e:
+        return {"error": _err_from_gax(e)}
+    except Exception as e:
+        return {"error": {"detail": str(e)}}
+
+
 
 # ---------- TOOLS (schemas) ----------
 TOOLS = [
@@ -639,6 +755,30 @@ TOOLS = [
         }
     },
     {
+        "name": "fetch_geo_performance",
+        "description": "Geo performance (city/region/country) for selected campaigns using geographic_view or user_location_view.",
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "customer_id":   { "type": "string", "maxLength": 20, "pattern": "^[0-9-]*$" },
+                "date_preset":   { "type": "string", "enum": ["TODAY","YESTERDAY","LAST_7_DAYS","LAST_30_DAYS","THIS_MONTH","LAST_MONTH"] },
+                "time_range": {
+                    "type": "object", "additionalProperties": False,
+                    "properties": {
+                        "since": { "type": "string", "maxLength": 10, "pattern": "^\\d{4}-\\d{2}-\\d{2}$" },
+                        "until": { "type": "string", "maxLength": 10, "pattern": "^\\d{4}-\\d{2}-\\d{2}$" }
+                    }
+                },
+                "campaign_ids":  { "type": "array", "maxItems": 200, "items": { "type": "string", "maxLength": 30, "pattern": "^[0-9-]*$" } },
+                "level":         { "type": "string", "enum": ["city","region","country"], "default": "city" },
+                "view":          { "type": "string", "enum": ["geographic","user_location"], "default": "geographic" },
+                "min_spend":     { "type": "number", "minimum": 0 },
+                "login_customer_id": { "type": "string", "maxLength": 20, "pattern": "^[0-9-]*$" }
+            }
+        }
+    },
+    {
         "name": "ping",
         "description": "Health check (public).",
         "inputSchema": {"type": "object", "additionalProperties": False, "properties": {}}
@@ -719,6 +859,8 @@ def _call_tool(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         return _pack_text(tool_fetch_change_history(args))
     if name == "fetch_budget_pacing":
         return _pack_text(tool_fetch_budget_pacing(args))
+    if name == "fetch_geo_performance":
+        return _pack_text(tool_fetch_geo_performance(args))
     return {"error": {"code": -32601, "message": f"Unknown tool: {name}"}}
 
 
