@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, Request
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse
 
 # Google Ads
@@ -18,11 +19,21 @@ from google.ads.googleads.errors import GoogleAdsException
 
 # -------------------- App & MCP basics --------------------
 APP_NAME = "mcp-google-ads"
-APP_VER = "0.4.1"
+APP_VER = "0.4.2"
 MCP_PROTO_DEFAULT = "2024-11-05"
 REGISTRY_PATH = Path(__file__).with_name("google_ads_field_registry.json")
 
+DEFAULT_FETCH_LIMIT = 100
+MAX_FETCH_LIMIT = 1000
+MAX_FIELDS_PER_FETCH = 25
+DEFAULT_VALIDATION_ENTITIES = ["campaign"]
+DEFAULT_VALIDATION_PRIORITY = "P0"
+DEFAULT_VALIDATION_MAX_FIELDS = 25
+MAX_VALIDATION_FIELDS = 50
+MAX_VALIDATION_ENTITIES = 4
+
 app = FastAPI()
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 
 # -------------------- Env & Ads client --------------------
@@ -93,6 +104,13 @@ def _google_ads_error_messages(e: GoogleAdsException) -> List[str]:
     except Exception:
         pass
     return [str(e)]
+
+
+def _clamped_int(value: Any, default: int, minimum: int, maximum: int) -> int:
+    try:
+        return max(minimum, min(int(value), maximum))
+    except Exception:
+        return default
 
 
 # -------------------- Field registry --------------------
@@ -208,9 +226,7 @@ def _field_registry_suggestion(public_name: str, meta: Dict[str, Any], from_reso
         "field": public_name,
         "google_ads_field": meta.get("google_ads_field"),
         "resource": from_resource,
-        "actions": [
-            f"remove '{from_resource}' from resources for '{public_name}' if this failure reproduces",
-        ],
+        "actions": [f"remove '{from_resource}' from resources for '{public_name}' if this failure reproduces"],
     }
     if meta.get("verified"):
         suggestion["actions"].append("set verified=false until this field/resource combination is validated")
@@ -302,8 +318,8 @@ def tool_list_google_ads_fields(args: Dict[str, Any]) -> Dict[str, Any]:
 
 def tool_validate_google_ads_registry(args: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Example usage:
-      validate_google_ads_registry customer_id=7241931996 entities=["campaign","search_term","landing_page","video"] priority="P0"
+    Safe examples:
+      validate_google_ads_registry customer_id=7241931996 entities=["campaign"] priority="P0" max_fields=10 dry_run=true
     """
     login = (args.get("login_customer_id") or LOGIN_CUSTOMER_ID or "").replace("-", "") or None
     customer_id = (args.get("customer_id") or "").replace("-", "") or ""
@@ -313,28 +329,27 @@ def tool_validate_google_ads_registry(args: Dict[str, Any]) -> Dict[str, Any]:
     registry = _load_field_registry()
     presets = registry.get("presets", {})
     fields = registry.get("fields", {})
-    requested_entities = [str(e).lower().strip() for e in (args.get("entities") or []) if str(e).strip()]
-    entities = requested_entities or sorted(presets)
+    requested_entities = [str(e).lower().strip() for e in (args.get("entities") or DEFAULT_VALIDATION_ENTITIES) if str(e).strip()]
+    entities = requested_entities or list(DEFAULT_VALIDATION_ENTITIES)
+    if len(entities) > MAX_VALIDATION_ENTITIES:
+        return {"error": {"detail": f"validate_google_ads_registry supports at most {MAX_VALIDATION_ENTITIES} entities per call"}}
     invalid_entities = [e for e in entities if e not in presets]
     if invalid_entities:
         return {"error": {"detail": f"invalid entities: {', '.join(invalid_entities)}", "valid_entities": sorted(presets)}}
 
-    priority = (args.get("priority") or "").upper().strip()
-    priorities = {priority} if priority else {"P0", "P1"}
-    if not priorities.issubset({"P0", "P1", "P2"}):
+    priority = (args.get("priority") or DEFAULT_VALIDATION_PRIORITY).upper().strip()
+    if priority not in {"P0", "P1", "P2"}:
         return {"error": {"detail": "priority must be one of P0, P1, P2"}}
+    max_fields = _clamped_int(args.get("max_fields", DEFAULT_VALIDATION_MAX_FIELDS), DEFAULT_VALIDATION_MAX_FIELDS, 1, MAX_VALIDATION_FIELDS)
     include_unverified = bool(args.get("include_unverified", False))
-
-    try:
-        client = _new_ads_client(login_cid=login)
-        svc = client.get_service("GoogleAdsService")
-    except Exception as e:
-        return {"error": {"detail": str(e)}}
+    dry_run = bool(args.get("dry_run", False))
+    compact = bool(args.get("compact", False))
 
     summary: Dict[str, Any] = {}
     passed: List[Dict[str, Any]] = []
     failed: List[Dict[str, Any]] = []
     suggestions: List[Dict[str, Any]] = []
+    planned_queries: List[Dict[str, Any]] = []
 
     for entity in entities:
         preset = presets[entity]
@@ -345,11 +360,10 @@ def tool_validate_google_ads_registry(args: Dict[str, Any]) -> Dict[str, Any]:
             (name, meta)
             for name, meta in sorted(fields.items())
             if from_resource in meta.get("resources", [])
-            and meta.get("priority") in priorities
+            and meta.get("priority") == priority
             and (include_unverified or bool(meta.get("verified", False)))
-        ]
-        entity_passed = 0
-        entity_failed = 0
+        ][:max_fields]
+        summary[entity] = {"resource": from_resource, "tested": 0, "passed": 0, "failed": 0, "base_fields": base_names}
 
         for name, meta in candidates:
             select_cols = _dedupe(base_gaql + [meta["google_ads_field"]])
@@ -359,46 +373,80 @@ def tool_validate_google_ads_registry(args: Dict[str, Any]) -> Dict[str, Any]:
             WHERE segments.date DURING LAST_7_DAYS
             LIMIT 1
             """
-            result_base = {
+            planned_queries.append({
                 "entity": entity,
                 "resource": from_resource,
                 "field": name,
                 "google_ads_field": meta.get("google_ads_field"),
-                "priority": meta.get("priority"),
-                "verified": bool(meta.get("verified", False)),
-            }
-            try:
-                _run_validation_query(svc, customer_id, query)
-                passed.append({**result_base, "query": query})
-                entity_passed += 1
-            except GoogleAdsException as e:
-                err = _err_from_gax(e)
-                messages = _google_ads_error_messages(e)
-                failed.append({**result_base, "query": query, "error": err, "messages": messages})
-                suggestions.append(_field_registry_suggestion(name, meta, from_resource))
-                entity_failed += 1
-            except Exception as e:
-                failed.append({**result_base, "query": query, "error": {"detail": str(e)}, "messages": [str(e)]})
-                suggestions.append(_field_registry_suggestion(name, meta, from_resource))
-                entity_failed += 1
+                "query": query,
+            })
 
-        summary[entity] = {
-            "resource": from_resource,
-            "tested": entity_passed + entity_failed,
-            "passed": entity_passed,
-            "failed": entity_failed,
-            "base_fields": base_names,
+    planned_query_count = len(planned_queries)
+    metadata = {
+        "entity_count": len(entities),
+        "planned_query_count": planned_query_count,
+        "executed_query_count": 0,
+        "max_fields": max_fields,
+        "dry_run": dry_run,
+    }
+    if planned_query_count > MAX_VALIDATION_FIELDS * len(entities):
+        return {"error": {"detail": "planned validation query count exceeds configured safety cap"}, "metadata": metadata}
+    if dry_run:
+        return {
+            "registry_version": registry.get("version"),
+            "validated_date_range": "LAST_7_DAYS",
+            "priority": priority,
+            "include_unverified": include_unverified,
+            "summary": summary,
+            "planned_queries": [] if compact else planned_queries,
+            "metadata": metadata,
         }
+
+    try:
+        client = _new_ads_client(login_cid=login)
+        svc = client.get_service("GoogleAdsService")
+    except Exception as e:
+        return {"error": {"detail": str(e)}, "metadata": metadata}
+
+    for item in planned_queries:
+        entity = item["entity"]
+        meta = fields[item["field"]]
+        result_base = {
+            "entity": entity,
+            "resource": item["resource"],
+            "field": item["field"],
+            "google_ads_field": item["google_ads_field"],
+            "priority": meta.get("priority"),
+            "verified": bool(meta.get("verified", False)),
+        }
+        try:
+            _run_validation_query(svc, customer_id, item["query"])
+            passed.append(result_base if compact else {**result_base, "query": item["query"]})
+            summary[entity]["passed"] += 1
+        except GoogleAdsException as e:
+            err = _err_from_gax(e)
+            messages = _google_ads_error_messages(e)
+            failed.append({**result_base, "query": item["query"], "error": err, "messages": messages} if not compact else {**result_base, "messages": messages})
+            suggestions.append(_field_registry_suggestion(item["field"], meta, item["resource"]))
+            summary[entity]["failed"] += 1
+        except Exception as e:
+            failed.append({**result_base, "query": item["query"], "error": {"detail": str(e)}, "messages": [str(e)]} if not compact else {**result_base, "messages": [str(e)]})
+            suggestions.append(_field_registry_suggestion(item["field"], meta, item["resource"]))
+            summary[entity]["failed"] += 1
+        finally:
+            summary[entity]["tested"] += 1
+            metadata["executed_query_count"] += 1
 
     return {
         "registry_version": registry.get("version"),
         "validated_date_range": "LAST_7_DAYS",
-        "priorities": sorted(priorities),
+        "priority": priority,
         "include_unverified": include_unverified,
         "summary": summary,
         "passed_fields": passed,
         "failed_fields": failed,
         "suggested_registry_updates": suggestions,
+        "metadata": metadata,
     }
 
 
@@ -461,23 +509,9 @@ def tool_fetch_campaign_summary(args: Dict[str, Any]) -> Dict[str, Any]:
 # -------------------- Generic metrics (registry-backed) --------------------
 def tool_fetch_metrics(args: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Inputs:
-      customer_id (required)
-      entity: account|campaign|ad_group|ad|search_term|geo|user_location|landing_page|conversion_action|asset_group|video
-      ids: optional numeric IDs for entities with a natural ID column
-      fields: public registry fields like cost, clicks, conversions
-      date_preset OR time_range like above
-      min_spend: optional spend filter, applied when cost is available for the entity
-      limit: optional, max 10000
-      order_by: optional public registry field name
-      login_customer_id optional
-
-    Sample calls:
+    Safe examples:
       fetch_metrics campaign fields=[cost, impressions, clicks, conversions]
-      fetch_metrics search_term fields=[cost, clicks, conversions]
-      fetch_metrics landing_page fields=[cost, clicks, conversions]
-      fetch_metrics video fields=[video_views, avg_cpv, video_quartile_100_rate]
-      list_google_ads_fields entity=campaign
+      fetch_metrics campaign compact=true limit=25
     """
     login = (args.get("login_customer_id") or LOGIN_CUSTOMER_ID or "").replace("-", "") or None
     customer_id = (args.get("customer_id") or "").replace("-", "") or ""
@@ -486,11 +520,14 @@ def tool_fetch_metrics(args: Dict[str, Any]) -> Dict[str, Any]:
 
     entity = (args.get("entity") or "campaign").lower().strip()
     fields_arg = args.get("fields")
+    if isinstance(fields_arg, list) and len(fields_arg) > MAX_FIELDS_PER_FETCH:
+        return {"error": {"detail": f"fetch_metrics accepts at most {MAX_FIELDS_PER_FETCH} requested fields per call"}}
     requested_fields = [str(f).strip() for f in fields_arg if str(f).strip()] if isinstance(fields_arg, list) else None
     from_resource, select_cols, resolved = _resolve_registry_fields(entity, requested_fields)
     if resolved and "error" in resolved[0]:
         return {"error": {"detail": "invalid fetch_metrics fields", "issues": resolved}}
     selected_fields = resolved
+    columns = [field["name"] for field in selected_fields]
 
     ids = [str(x).replace("-", "").strip() for x in (args.get("ids") or []) if str(x).strip()]
     where_time = _where_time(args)
@@ -521,31 +558,33 @@ def tool_fetch_metrics(args: Dict[str, Any]) -> Dict[str, Any]:
             return {"error": {"detail": f"order_by field '{order_by}' is not compatible with entity '{entity}'"}}
         order_clause = f" ORDER BY {order_meta['google_ads_field']} DESC "
 
-    limit = args.get("limit")
-    limit_clause = ""
-    if limit is not None:
-        try:
-            limit_clause = f" LIMIT {max(1, min(int(limit), 10000))} "
-        except Exception:
-            return {"error": {"detail": "limit must be an integer"}}
-
+    limit = _clamped_int(args.get("limit", DEFAULT_FETCH_LIMIT), DEFAULT_FETCH_LIMIT, 1, MAX_FETCH_LIMIT)
+    compact = bool(args.get("compact", False))
+    dry_run = bool(args.get("dry_run", False))
     q = f"""
     SELECT {', '.join(select_cols)}
     FROM {from_resource}
     WHERE {where_time}{id_clause}{spend_clause}
     {order_clause}
-    {limit_clause}
+    LIMIT {limit}
     """
+    metadata = {"row_count": 0, "field_count": len(columns), "limit": limit, "compact": compact, "dry_run": dry_run}
+    if dry_run:
+        return {"query": q, "entity": entity, "columns": columns, "selected_fields": selected_fields, "metadata": metadata}
+
     try:
         client = _new_ads_client(login_cid=login)
         svc = client.get_service("GoogleAdsService")
         resp = svc.search(request={"customer_id": customer_id, "query": q})
-        out = [_serialize_registry_row(r, selected_fields) for r in resp]
-        return {"query": q, "entity": entity, "rows": out}
+        dict_rows = [_serialize_registry_row(r, selected_fields) for r in resp]
+        metadata["row_count"] = len(dict_rows)
+        if compact:
+            return {"query": q, "entity": entity, "columns": columns, "rows": [[row.get(col) for col in columns] for row in dict_rows], "metadata": metadata}
+        return {"query": q, "entity": entity, "rows": dict_rows, "metadata": metadata}
     except GoogleAdsException as e:
-        return {"error": _err_from_gax(e)}
+        return {"error": _err_from_gax(e), "metadata": metadata}
     except Exception as e:
-        return {"error": {"detail": str(e)}}
+        return {"error": {"detail": str(e)}, "metadata": metadata}
 
 
 # -------------------- Search terms (top spend) --------------------
@@ -866,12 +905,14 @@ TOOLS = [
                 "customer_id": CUSTOMER_ID_SCHEMA,
                 "entity": {"type": "string", "enum": ENTITY_ENUM, "default": "campaign"},
                 "ids": {"type": "array", "maxItems": 200, "items": {"type": "string", "maxLength": 30, "pattern": "^[0-9-]*$"}},
-                "fields": {"type": "array", "maxItems": 100, "items": {"type": "string", "maxLength": 96}, "description": "Public registry fields such as cost, clicks, conversions."},
+                "fields": {"type": "array", "maxItems": MAX_FIELDS_PER_FETCH, "items": {"type": "string", "maxLength": 96}, "description": "Public registry fields such as cost, clicks, conversions."},
                 "date_preset": DATE_PRESET_SCHEMA,
                 "time_range": TIME_RANGE_SCHEMA,
                 "min_spend": {"type": "number", "minimum": 1},
-                "limit": {"type": "integer", "minimum": 1, "maximum": 10000},
+                "limit": {"type": "integer", "minimum": 1, "maximum": MAX_FETCH_LIMIT, "default": DEFAULT_FETCH_LIMIT},
                 "order_by": {"type": "string", "maxLength": 96, "description": "Public registry field name to sort by descending."},
+                "dry_run": {"type": "boolean", "default": False},
+                "compact": {"type": "boolean", "default": False},
                 "login_customer_id": CUSTOMER_ID_SCHEMA,
             },
         },
@@ -891,16 +932,19 @@ TOOLS = [
     },
     {
         "name": "validate_google_ads_registry",
-        "description": "Run live LIMIT 1 GAQL checks for registry field/resource compatibility and return pass/fail suggestions.",
+        "description": "Run capped live LIMIT 1 GAQL checks for registry field/resource compatibility and return pass/fail suggestions.",
         "inputSchema": {
             "type": "object",
             "additionalProperties": False,
             "properties": {
                 "customer_id": CUSTOMER_ID_SCHEMA,
                 "login_customer_id": CUSTOMER_ID_SCHEMA,
-                "entities": {"type": "array", "maxItems": 20, "items": {"type": "string", "enum": ENTITY_ENUM}},
-                "priority": {"type": "string", "enum": ["P0", "P1", "P2"], "description": "When omitted, validates P0 and P1 fields."},
+                "entities": {"type": "array", "maxItems": MAX_VALIDATION_ENTITIES, "items": {"type": "string", "enum": ENTITY_ENUM}, "default": DEFAULT_VALIDATION_ENTITIES},
+                "priority": {"type": "string", "enum": ["P0", "P1", "P2"], "default": DEFAULT_VALIDATION_PRIORITY},
                 "include_unverified": {"type": "boolean", "default": False},
+                "max_fields": {"type": "integer", "minimum": 1, "maximum": MAX_VALIDATION_FIELDS, "default": DEFAULT_VALIDATION_MAX_FIELDS},
+                "dry_run": {"type": "boolean", "default": False},
+                "compact": {"type": "boolean", "default": False},
             },
             "required": ["customer_id"],
         },
