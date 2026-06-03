@@ -18,7 +18,7 @@ from google.ads.googleads.errors import GoogleAdsException
 
 # -------------------- App & MCP basics --------------------
 APP_NAME = "mcp-google-ads"
-APP_VER = "0.4.0"
+APP_VER = "0.4.1"
 MCP_PROTO_DEFAULT = "2024-11-05"
 REGISTRY_PATH = Path(__file__).with_name("google_ads_field_registry.json")
 
@@ -84,6 +84,15 @@ def _err_from_gax(e: GoogleAdsException) -> Dict[str, Any]:
     except Exception:
         pass
     return details
+
+
+def _google_ads_error_messages(e: GoogleAdsException) -> List[str]:
+    try:
+        if getattr(e, "failure", None) and e.failure.errors:
+            return [er.message for er in e.failure.errors if getattr(er, "message", None)]
+    except Exception:
+        pass
+    return [str(e)]
 
 
 # -------------------- Field registry --------------------
@@ -194,6 +203,28 @@ def _registry_field_is_compatible(public_name: str, from_resource: str) -> bool:
     return from_resource in meta.get("resources", [])
 
 
+def _field_registry_suggestion(public_name: str, meta: Dict[str, Any], from_resource: str) -> Dict[str, Any]:
+    suggestion: Dict[str, Any] = {
+        "field": public_name,
+        "google_ads_field": meta.get("google_ads_field"),
+        "resource": from_resource,
+        "actions": [
+            f"remove '{from_resource}' from resources for '{public_name}' if this failure reproduces",
+        ],
+    }
+    if meta.get("verified"):
+        suggestion["actions"].append("set verified=false until this field/resource combination is validated")
+    if not meta.get("verification_note"):
+        suggestion["actions"].append("add verification_note documenting the live GAQL result")
+    return suggestion
+
+
+def _run_validation_query(svc: Any, customer_id: str, query: str) -> None:
+    rows = svc.search(request={"customer_id": customer_id, "query": query})
+    for _ in rows:
+        break
+
+
 # -------------------- Minimal tools --------------------
 def tool_ping(_args: Dict[str, Any]) -> Dict[str, Any]:
     return {"ok": True}
@@ -262,10 +293,113 @@ def tool_list_google_ads_fields(args: Dict[str, Any]) -> Dict[str, Any]:
                 "google_ads_field": meta.get("google_ads_field"),
                 "verified": bool(meta.get("verified", False)),
                 "priority": meta.get("priority"),
+                "verification_note": meta.get("verification_note"),
             })
         return {"version": registry.get("version"), "entity": entity or None, "count": len(out), "fields": out}
     except Exception as e:
         return {"error": {"detail": str(e)}}
+
+
+def tool_validate_google_ads_registry(args: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Example usage:
+      validate_google_ads_registry customer_id=7241931996 entities=["campaign","search_term","landing_page","video"] priority="P0"
+    """
+    login = (args.get("login_customer_id") or LOGIN_CUSTOMER_ID or "").replace("-", "") or None
+    customer_id = (args.get("customer_id") or "").replace("-", "") or ""
+    if not customer_id:
+        return {"error": {"detail": "customer_id required"}}
+
+    registry = _load_field_registry()
+    presets = registry.get("presets", {})
+    fields = registry.get("fields", {})
+    requested_entities = [str(e).lower().strip() for e in (args.get("entities") or []) if str(e).strip()]
+    entities = requested_entities or sorted(presets)
+    invalid_entities = [e for e in entities if e not in presets]
+    if invalid_entities:
+        return {"error": {"detail": f"invalid entities: {', '.join(invalid_entities)}", "valid_entities": sorted(presets)}}
+
+    priority = (args.get("priority") or "").upper().strip()
+    priorities = {priority} if priority else {"P0", "P1"}
+    if not priorities.issubset({"P0", "P1", "P2"}):
+        return {"error": {"detail": "priority must be one of P0, P1, P2"}}
+    include_unverified = bool(args.get("include_unverified", False))
+
+    try:
+        client = _new_ads_client(login_cid=login)
+        svc = client.get_service("GoogleAdsService")
+    except Exception as e:
+        return {"error": {"detail": str(e)}}
+
+    summary: Dict[str, Any] = {}
+    passed: List[Dict[str, Any]] = []
+    failed: List[Dict[str, Any]] = []
+    suggestions: List[Dict[str, Any]] = []
+
+    for entity in entities:
+        preset = presets[entity]
+        from_resource = preset["from"]
+        base_names = [name for name in preset.get("base_fields", []) if name in fields and from_resource in fields[name].get("resources", [])]
+        base_gaql = [fields[name]["google_ads_field"] for name in base_names]
+        candidates = [
+            (name, meta)
+            for name, meta in sorted(fields.items())
+            if from_resource in meta.get("resources", [])
+            and meta.get("priority") in priorities
+            and (include_unverified or bool(meta.get("verified", False)))
+        ]
+        entity_passed = 0
+        entity_failed = 0
+
+        for name, meta in candidates:
+            select_cols = _dedupe(base_gaql + [meta["google_ads_field"]])
+            query = f"""
+            SELECT {', '.join(select_cols)}
+            FROM {from_resource}
+            WHERE segments.date DURING LAST_7_DAYS
+            LIMIT 1
+            """
+            result_base = {
+                "entity": entity,
+                "resource": from_resource,
+                "field": name,
+                "google_ads_field": meta.get("google_ads_field"),
+                "priority": meta.get("priority"),
+                "verified": bool(meta.get("verified", False)),
+            }
+            try:
+                _run_validation_query(svc, customer_id, query)
+                passed.append({**result_base, "query": query})
+                entity_passed += 1
+            except GoogleAdsException as e:
+                err = _err_from_gax(e)
+                messages = _google_ads_error_messages(e)
+                failed.append({**result_base, "query": query, "error": err, "messages": messages})
+                suggestions.append(_field_registry_suggestion(name, meta, from_resource))
+                entity_failed += 1
+            except Exception as e:
+                failed.append({**result_base, "query": query, "error": {"detail": str(e)}, "messages": [str(e)]})
+                suggestions.append(_field_registry_suggestion(name, meta, from_resource))
+                entity_failed += 1
+
+        summary[entity] = {
+            "resource": from_resource,
+            "tested": entity_passed + entity_failed,
+            "passed": entity_passed,
+            "failed": entity_failed,
+            "base_fields": base_names,
+        }
+
+    return {
+        "registry_version": registry.get("version"),
+        "validated_date_range": "LAST_7_DAYS",
+        "priorities": sorted(priorities),
+        "include_unverified": include_unverified,
+        "summary": summary,
+        "passed_fields": passed,
+        "failed_fields": failed,
+        "suggested_registry_updates": suggestions,
+    }
 
 
 # -------------------- Campaign summary (with min_spend) --------------------
@@ -278,7 +412,6 @@ def tool_fetch_campaign_summary(args: Dict[str, Any]) -> Dict[str, Any]:
     where_time = _where_time(args)
     min_spend = max(1.0, float(args.get("min_spend", 1.0)))
     min_cost_micros = int(min_spend * 1_000_000)
-
     q = f"""
     SELECT
       campaign.id, campaign.name, campaign.status,
@@ -289,7 +422,6 @@ def tool_fetch_campaign_summary(args: Dict[str, Any]) -> Dict[str, Any]:
       AND metrics.cost_micros >= {min_cost_micros}
     ORDER BY metrics.cost_micros DESC
     """
-
     try:
         client = _new_ads_client(login_cid=login)
         svc = client.get_service("GoogleAdsService")
@@ -362,7 +494,6 @@ def tool_fetch_metrics(args: Dict[str, Any]) -> Dict[str, Any]:
 
     ids = [str(x).replace("-", "").strip() for x in (args.get("ids") or []) if str(x).strip()]
     where_time = _where_time(args)
-
     id_col = {
         "account": "customer.id",
         "campaign": "campaign.id",
@@ -405,7 +536,6 @@ def tool_fetch_metrics(args: Dict[str, Any]) -> Dict[str, Any]:
     {order_clause}
     {limit_clause}
     """
-
     try:
         client = _new_ads_client(login_cid=login)
         svc = client.get_service("GoogleAdsService")
@@ -431,7 +561,6 @@ def tool_fetch_search_terms(args: Dict[str, Any]) -> Dict[str, Any]:
     min_clicks = int(args.get("min_clicks", 0))
     cids = [c.replace("-", "") for c in (args.get("campaign_ids") or [])]
     agids = [g.replace("-", "") for g in (args.get("ad_group_ids") or [])]
-
     filters = [where_time, f" AND metrics.cost_micros >= {min_cost_micros} "]
     if min_clicks > 0:
         filters.append(f" AND metrics.clicks >= {min_clicks} ")
@@ -456,7 +585,6 @@ def tool_fetch_search_terms(args: Dict[str, Any]) -> Dict[str, Any]:
     ORDER BY metrics.cost_micros DESC
     LIMIT {limit}
     """
-
     try:
         client = _new_ads_client(login_cid=login)
         svc = client.get_service("GoogleAdsService")
@@ -515,7 +643,6 @@ def tool_fetch_change_history(args: Dict[str, Any]) -> Dict[str, Any]:
     ORDER BY change_event.change_date_time DESC
     LIMIT {limit}
     """
-
     try:
         client = _new_ads_client(login_cid=login)
         svc = client.get_service("GoogleAdsService")
@@ -570,7 +697,6 @@ def tool_fetch_budget_pacing(args: Dict[str, Any]) -> Dict[str, Any]:
     FROM customer
     WHERE segments.date BETWEEN '{start:%Y-%m-%d}' AND '{end:%Y-%m-%d}'
     """
-
     try:
         client = _new_ads_client(login_cid=login)
         svc = client.get_service("GoogleAdsService")
@@ -651,7 +777,6 @@ def tool_fetch_geo_performance(args: Dict[str, Any]) -> Dict[str, Any]:
     WHERE {where_time}{cid_clause}{spend_clause}
     ORDER BY metrics.cost_micros DESC
     """
-
     try:
         client = _new_ads_client(login_cid=login)
         svc = client.get_service("GoogleAdsService")
@@ -762,6 +887,22 @@ TOOLS = [
                 "priority": {"type": "string", "enum": ["P0", "P1", "P2"]},
                 "kind": {"type": "string", "enum": ["metric", "dimension"]},
             },
+        },
+    },
+    {
+        "name": "validate_google_ads_registry",
+        "description": "Run live LIMIT 1 GAQL checks for registry field/resource compatibility and return pass/fail suggestions.",
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "customer_id": CUSTOMER_ID_SCHEMA,
+                "login_customer_id": CUSTOMER_ID_SCHEMA,
+                "entities": {"type": "array", "maxItems": 20, "items": {"type": "string", "enum": ENTITY_ENUM}},
+                "priority": {"type": "string", "enum": ["P0", "P1", "P2"], "description": "When omitted, validates P0 and P1 fields."},
+                "include_unverified": {"type": "boolean", "default": False},
+            },
+            "required": ["customer_id"],
         },
     },
     {
@@ -892,6 +1033,8 @@ def _call_tool(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         return _pack_text(tool_list_resources(args))
     if name == "list_google_ads_fields":
         return _pack_text(tool_list_google_ads_fields(args))
+    if name == "validate_google_ads_registry":
+        return _pack_text(tool_validate_google_ads_registry(args))
     if name == "fetch_campaign_summary":
         return _pack_text(tool_fetch_campaign_summary(args))
     if name == "fetch_metrics":
